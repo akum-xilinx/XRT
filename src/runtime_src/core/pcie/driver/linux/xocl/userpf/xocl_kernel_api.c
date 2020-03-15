@@ -58,37 +58,68 @@ struct xocl_drm_dev_info uapp_drm_context;
 
 int xocl_create_bo_ifc(struct drm_xocl_create_bo *args)
 {
-	return xocl_create_bo_ioctl(uapp_drm_context.dev, args, 
+	int ret;
+
+	if (!atomic_read(&uapp_drm_context.active)) {
+		return -EFAULT;
+	}
+	ret = xocl_create_bo_ioctl(uapp_drm_context.dev, args, 
 							uapp_drm_context.file);
+
+	return ret;
 }
 
 EXPORT_SYMBOL_GPL(xocl_create_bo_ifc);
 
 int xocl_map_bo_ifc(struct drm_xocl_map_bo *args)
 {
-	return xocl_map_bo_ioctl(uapp_drm_context.dev, args, 
+	int ret;
+
+	if (!atomic_read(&uapp_drm_context.active)) {
+		return -EFAULT;
+	}
+	ret = xocl_map_bo_ioctl(uapp_drm_context.dev, args, 
 							uapp_drm_context.file);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(xocl_map_bo_ifc);
 
 int xocl_sync_bo_ifc(struct drm_xocl_sync_bo *args)
 {
-	return xocl_sync_bo_ioctl(uapp_drm_context.dev, args, 
+	int ret;
+
+	if (!atomic_read(&uapp_drm_context.active)) {
+		return -EFAULT;
+	}
+	ret = xocl_sync_bo_ioctl(uapp_drm_context.dev, args, 
 							uapp_drm_context.file);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(xocl_sync_bo_ifc);
 
 int xocl_info_bo_ifc(struct drm_xocl_info_bo *args)
 {
-	return xocl_info_bo_ioctl(uapp_drm_context.dev, args, 
+	int ret;
+
+	if (!atomic_read(&uapp_drm_context.active)) {
+		return -EFAULT;
+	}
+	ret = xocl_info_bo_ioctl(uapp_drm_context.dev, args, 
 							uapp_drm_context.file);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(xocl_info_bo_ifc);
 
 int xocl_execbuf_ifc(struct drm_xocl_execbuf *args)
 {
-	return xocl_execbuf_ioctl(uapp_drm_context.dev, args, 
+	int ret;
+
+	if (!atomic_read(&uapp_drm_context.active)) {
+		return -EFAULT;
+	}
+	ret = xocl_execbuf_ioctl(uapp_drm_context.dev, args, 
 							uapp_drm_context.file);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(xocl_execbuf_ifc);
 
@@ -98,6 +129,10 @@ int xocl_create_kmem_bo_ifc(struct drm_xocl_kptr_bo *args)
 	struct drm_xocl_bo *xobj;
 	struct xocl_drm *drm_p = uapp_drm_context.dev->dev_private;
 	uint64_t page_count = 0;
+
+	if (!atomic_read(&uapp_drm_context.active)) {
+		return -EFAULT;
+	}
 
 	if (offset_in_page(args->addr))
 		return -EINVAL;
@@ -147,6 +182,7 @@ int xocl_create_kmem_bo_ifc(struct drm_xocl_kptr_bo *args)
 
 	xocl_describe(xobj);
 	XOCL_DRM_GEM_OBJECT_PUT_UNLOCKED(&xobj->base);
+
 	return ret;
 
 out0:
@@ -155,7 +191,7 @@ out0:
 out1:
 	xocl_drm_free_bo(&xobj->base);
 	DRM_DEBUG("handle creation failed\n");
-	return ret;	
+	return ret;
 }
 EXPORT_SYMBOL_GPL(xocl_create_kmem_bo_ifc);
 
@@ -166,10 +202,15 @@ int xocl_remap_kmem_bo_ifc(struct drm_xocl_kptr_bo *args)
         unsigned int page_count;
 
         struct drm_xocl_bo *xobj;
-        struct drm_gem_object *gem_obj = xocl_gem_object_lookup(
-							uapp_drm_context.dev, 
-							uapp_drm_context.file,
-                                                        args->handle);
+        struct drm_gem_object *gem_obj;
+
+	if (!atomic_read(&uapp_drm_context.active)) {
+		return -EFAULT;
+	}
+	gem_obj = xocl_gem_object_lookup(uapp_drm_context.dev, 
+					uapp_drm_context.file,
+                                        args->handle);
+
         if (!gem_obj) {
                 DRM_ERROR("Failed to look up GEM BO %d\n", args->handle);
                 return -ENOENT;
@@ -221,7 +262,7 @@ out0:
         drm_free_large(xobj->pages);
         xobj->pages = NULL;
 out1:
-        return ret;
+	return ret;
 }
 EXPORT_SYMBOL_GPL(xocl_remap_kmem_bo_ifc);
 
@@ -235,6 +276,10 @@ int xocl_create_sgl_bo_ifc(struct drm_xocl_sgl_bo *args)
 
         struct scatterlist *sg;
         int nents;
+
+	if (!atomic_read(&uapp_drm_context.active)) {
+		return -EFAULT;
+	}
 
 	xobj = xocl_drm_create_bo(drm_p, args->size, 
 					(args->flags | XCL_BO_FLAGS_KERNPTR));
@@ -294,14 +339,14 @@ int xocl_create_sgl_bo_ifc(struct drm_xocl_sgl_bo *args)
         xocl_describe(xobj);
         drm_gem_object_unreference_unlocked(&xobj->base);
 
-        return ret;
+	return ret;
 out0:
         drm_free_large(xobj->pages);
         xobj->pages = NULL;
 out1:
 	xocl_drm_free_bo(&xobj->base);
         DRM_DEBUG("handle creation failed\n");
-        return ret;
+	return ret;
 }
 EXPORT_SYMBOL_GPL(xocl_create_sgl_bo_ifc);
 
@@ -314,10 +359,14 @@ int xocl_remap_sgl_bo_ifc(struct drm_xocl_sgl_bo *args)
 	int nents = sg_nents((struct scatterlist *)args->sgl);
 
 	struct drm_xocl_bo *xobj;
-	struct drm_gem_object *gem_obj = xocl_gem_object_lookup(
-							uapp_drm_context.dev, 
-							uapp_drm_context.file,
-							args->handle);
+        struct drm_gem_object *gem_obj;
+	if (!atomic_read(&uapp_drm_context.active)) {
+		return -EFAULT;
+	}
+	gem_obj = xocl_gem_object_lookup(uapp_drm_context.dev, 
+					uapp_drm_context.file,
+                                        args->handle);
+
 	if (!gem_obj) {
 		DRM_ERROR("Failed to look up GEM BO %d\n", args->handle);
 		return -ENOENT;
@@ -373,6 +422,10 @@ void __iomem *xocl_get_bo_kernel_vaddr(uint32_t bo_handle)
 {
 	struct drm_gem_object *obj;
 	struct drm_xocl_bo *xobj;
+
+	if (!atomic_read(&uapp_drm_context.active)) {
+		return NULL;
+	}
 
 	obj = xocl_gem_object_lookup(uapp_drm_context.dev, 
 					uapp_drm_context.file, bo_handle);

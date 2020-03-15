@@ -1002,8 +1002,7 @@ void xocl_p2p_fini(struct xocl_dev *xdev, bool recov_bar_sz)
 	int p2p_bar = -1;
 	int i;
 
-	mutex_destroy(&xdev->p2p_mem_chunk_lock);
-
+	mutex_lock(&xdev->p2p_mem_chunk_lock);
 	for (i = 0; i < xdev->p2p_mem_chunk_num; i++) {
 		if (xdev->p2p_mem_chunks[i].xpmc_ref > 0) {
 			xocl_err(&pdev->dev, "still %d ref for P2P chunk[%d]",
@@ -1012,7 +1011,9 @@ void xocl_p2p_fini(struct xocl_dev *xdev, bool recov_bar_sz)
 			xocl_p2p_mem_chunk_release(&xdev->p2p_mem_chunks[i]);
 		}
 	}
+	mutex_unlock(&xdev->p2p_mem_chunk_lock);
 
+	mutex_destroy(&xdev->p2p_mem_chunk_lock);
 	vfree(xdev->p2p_mem_chunks);
 	xdev->p2p_mem_chunk_num = 0;
 	xdev->p2p_mem_chunks = NULL;

@@ -195,6 +195,7 @@ struct xocl_mm_wrapper {
 struct xocl_drm_dev_info {
         struct drm_device *dev;
         struct drm_file *file;
+	atomic_t active;
 };
 
 /* ioctl functions */

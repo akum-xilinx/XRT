@@ -290,6 +290,7 @@ static void xocl_client_release(struct drm_device *dev, struct drm_file *filp)
 {
 	struct xocl_drm	*drm_p = dev->dev_private;
 
+	xocl_delete_app_context_ioctl(dev, NULL, filp);
 	xocl_exec_destroy_client(drm_p->xdev, &filp->driver_priv);
 	xocl_drvinst_close(drm_p);
 }

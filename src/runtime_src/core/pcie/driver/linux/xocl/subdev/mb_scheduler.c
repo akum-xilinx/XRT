@@ -2354,6 +2354,7 @@ exec_notify_host(struct exec_core *exec, struct xocl_cmd* xcmd)
 	atomic_inc(&client->trigger);
 	mutex_unlock(&xdev->dev_lock); // eliminate ?
 	wake_up_interruptible(&exec->poll_wait_queue);
+	queue_work(exec->completion_wq, &xcmd->bo->metadata.compltn_work);
 
 	SCHED_DEBUGF("<- %s\n", __func__);
 }
@@ -2394,7 +2395,6 @@ exec_mark_cmd_state(struct exec_core *exec, struct xocl_cmd *xcmd, enum ert_cmd_
 		ert_release_slot(exec->ert, xcmd);
 
 	exec_notify_host(exec, xcmd);
-	queue_work(exec->completion_wq, &xcmd->bo->metadata.compltn_work);
 
 	// Deactivate command and trigger chain of waiting commands
 	cmd_mark_deactive(xcmd);
