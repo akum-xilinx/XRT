@@ -257,6 +257,7 @@ int xocl_remap_kmem_bo_ifc(struct drm_xocl_kptr_bo *args)
                 ret = -ENOMEM;
         }
 
+	XOCL_DRM_GEM_OBJECT_PUT_UNLOCKED(&xobj->base);
         return ret;
 out0:
         drm_free_large(xobj->pages);
@@ -337,7 +338,7 @@ int xocl_create_sgl_bo_ifc(struct drm_xocl_sgl_bo *args)
                 goto out1;
 
         xocl_describe(xobj);
-        drm_gem_object_unreference_unlocked(&xobj->base);
+	XOCL_DRM_GEM_OBJECT_PUT_UNLOCKED(&xobj->base);
 
 	return ret;
 out0:
@@ -410,6 +411,7 @@ int xocl_remap_sgl_bo_ifc(struct drm_xocl_sgl_bo *args)
                 goto out0;
 	}
 
+	XOCL_DRM_GEM_OBJECT_PUT_UNLOCKED(&xobj->base);
 	return ret;
 out0:
 	drm_free_large(xobj->pages);
@@ -435,6 +437,8 @@ void __iomem *xocl_get_bo_kernel_vaddr(uint32_t bo_handle)
 		DRM_ERROR("Failed to look up GEM BO %d\n", bo_handle);
 		return NULL;
 	}
+
+	XOCL_DRM_GEM_OBJECT_PUT_UNLOCKED(&xobj->base);
 
 	if (xobj->flags & XOCL_P2P_MEM)
 		return page_to_virt(xobj->pages[0]);
