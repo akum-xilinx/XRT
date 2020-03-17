@@ -1753,15 +1753,6 @@ int shim::xclStoreAppContext()
     return ret;
 }
 
-/*
- * xclDeleteAppContext()
- */
-int shim::xclDeleteAppContext()
-{
-    int ret = mDev->ioctl(mUserHandle, DRM_IOCTL_XOCL_DELETE_APP_CONTEXT);
-    return ret;
-}
-
 } // namespace xocl
 
 /*******************************/
@@ -2281,11 +2272,5 @@ int xclStoreAppContext(xclDeviceHandle handle)
 {
     xocl::shim *drv = xocl::shim::handleCheck(handle);
     return drv ? drv->xclStoreAppContext() : -ENODEV;
-}
-
-int xclDeleteAppContext(xclDeviceHandle handle)
-{
-    xocl::shim *drv = xocl::shim::handleCheck(handle);
-    return drv ? drv->xclDeleteAppContext() : -ENODEV;
 }
 

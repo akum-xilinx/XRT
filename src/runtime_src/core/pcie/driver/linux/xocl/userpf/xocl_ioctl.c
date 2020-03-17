@@ -550,9 +550,15 @@ int xocl_store_app_context_ioctl(struct drm_device *dev, void *data,
 int xocl_delete_app_context_ioctl(struct drm_device *dev, void *data,
         struct drm_file *filp)
 {
-        pr_info("%s: devp %p filp %p", __func__, dev, filp);
-	atomic_dec(&uapp_drm_context.active);
-        uapp_drm_context.dev = NULL;
-        uapp_drm_context.file = NULL;
-        return 0;
+	if(atomic_read(&uapp_drm_context.active) == 1 && filp == uapp_drm_context.file){
+		pr_info("%s: devp %p filp %p", __func__, dev, filp);
+		atomic_dec(&uapp_drm_context.active);
+		uapp_drm_context.dev = NULL;
+		uapp_drm_context.file = NULL;
+		return 0;
+	}
+	else{
+		return -1;
+	}
+
 }
