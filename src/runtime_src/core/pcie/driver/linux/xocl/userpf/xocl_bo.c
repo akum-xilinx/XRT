@@ -165,7 +165,14 @@ static void xocl_free_bo(struct drm_gem_object *obj)
 	}
 	xobj->pages = NULL;
 
-	if (!xocl_bo_import(xobj)) {
+	if (xobj->flags == XOCL_BO_KERNPTR) {
+		DRM_DEBUG("Freeing kernel buffer\n");
+		if (xobj->sgt ) {
+			kfree(xobj->sgt);
+		}
+		xobj->sgt = NULL;
+		xocl_free_mm_node(xobj);
+	} else if (!xocl_bo_import(xobj)) {
 		DRM_DEBUG("Freeing regular buffer\n");
 		if (xobj->sgt) {
 			sg_free_table(xobj->sgt);

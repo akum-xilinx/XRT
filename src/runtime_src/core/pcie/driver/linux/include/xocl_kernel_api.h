@@ -68,6 +68,6 @@ int xocl_create_sgl_bo_ifc(struct drm_xocl_sgl_bo *args);
 int xocl_remap_sgl_bo_ifc(struct drm_xocl_sgl_bo *args);
 void xocl_delete_bo_ifc(uint32_t bo_handle);
 void __iomem *xocl_get_bo_kernel_vaddr(uint32_t bo_handle);
-
+void xocl_release_buffers_ifc(void);
 
 #endif

@@ -54,18 +54,50 @@ static inline void *drm_malloc_ab(size_t nmemb, size_t size)
 }
 #endif
 
+struct list_head gem_obj_list;
+LIST_HEAD(gem_obj_list);
+static DEFINE_SPINLOCK(gem_obj_list_lock);
+
+struct kernel_gem_obj_node{
+	struct list_head list;
+	struct drm_gem_object *obj;
+};
+
 struct xocl_drm_dev_info uapp_drm_context;
+
+static int xocl_gem_obj_to_kernel_list(struct drm_gem_object *gem_obj)
+{
+	struct kernel_gem_obj_node *gem_node = (struct kernel_gem_obj_node *) 
+			kzalloc	(sizeof(struct kernel_gem_obj_node),GFP_KERNEL);
+	if(!gem_node)
+		return -ENOMEM;
+
+	gem_node->obj = gem_obj;
+
+	spin_lock(&gem_obj_list_lock);
+	list_add_tail(&gem_node->list, &gem_obj_list);
+	spin_unlock(&gem_obj_list_lock);
+
+	return 0;
+}
 
 int xocl_create_bo_ifc(struct drm_xocl_create_bo *args)
 {
 	int ret;
+        struct drm_gem_object *gem_obj;
 
 	if (!atomic_read(&uapp_drm_context.active)) {
 		return -EFAULT;
 	}
 	ret = xocl_create_bo_ioctl(uapp_drm_context.dev, args, 
 							uapp_drm_context.file);
+	if (ret)
+		return ret;
 
+	gem_obj = xocl_gem_object_lookup(uapp_drm_context.dev, 
+					uapp_drm_context.file,
+                                        args->handle);
+	ret = xocl_gem_obj_to_kernel_list(gem_obj);
 	return ret;
 }
 
@@ -181,7 +213,7 @@ int xocl_create_kmem_bo_ifc(struct drm_xocl_kptr_bo *args)
 		goto out1;
 
 	xocl_describe(xobj);
-	XOCL_DRM_GEM_OBJECT_PUT_UNLOCKED(&xobj->base);
+	ret = xocl_gem_obj_to_kernel_list(&xobj->base);
 
 	return ret;
 
@@ -338,7 +370,7 @@ int xocl_create_sgl_bo_ifc(struct drm_xocl_sgl_bo *args)
                 goto out1;
 
         xocl_describe(xobj);
-	XOCL_DRM_GEM_OBJECT_PUT_UNLOCKED(&xobj->base);
+	ret = xocl_gem_obj_to_kernel_list(&xobj->base);
 
 	return ret;
 out0:
@@ -447,5 +479,21 @@ void __iomem *xocl_get_bo_kernel_vaddr(uint32_t bo_handle)
 }
 EXPORT_SYMBOL_GPL(xocl_get_bo_kernel_vaddr);
 
+void xocl_release_buffers_ifc(void)
+{
+        struct kernel_gem_obj_node *gem_node;
+        struct list_head *pos, *next;
 
+        printk ("%s", __func__);
+	spin_lock(&gem_obj_list_lock);
+        list_for_each_safe(pos, next, &gem_obj_list){
+                gem_node = list_entry(pos, struct kernel_gem_obj_node, list);
+		//xocl_drm_free_bo(gem_node->obj);
+		XOCL_DRM_GEM_OBJECT_PUT_UNLOCKED(gem_node->obj);
+                list_del(pos);
+                kfree(gem_node);
+        }
+	spin_unlock(&gem_obj_list_lock);
+}
+EXPORT_SYMBOL_GPL(xocl_release_buffers_ifc);
 
