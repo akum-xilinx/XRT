@@ -198,15 +198,6 @@ int xocl_create_kmem_bo_ifc(struct drm_xocl_kptr_bo *args)
 		goto out0;
 	}
 
-	/* TODO: resolve the cache issue */
-	xobj->vmapping = vmap(xobj->pages, page_count, VM_MAP, PAGE_KERNEL);
-
-	if (!xobj->vmapping) {
-		ret = -ENOMEM;
-		goto out1;
-	}
-
-
 	ret = drm_gem_handle_create(uapp_drm_context.file, &xobj->base, 
 								&args->handle);
 	if (ret)
@@ -282,13 +273,6 @@ int xocl_remap_kmem_bo_ifc(struct drm_xocl_kptr_bo *args)
                 goto out0;
         }
 
-        /* TODO: resolve the cache issue */
-        xobj->vmapping = vmap(xobj->pages, page_count, VM_MAP, PAGE_KERNEL);
-
-	 if (!xobj->vmapping) {
-                ret = -ENOMEM;
-        }
-
 	XOCL_DRM_GEM_OBJECT_PUT_UNLOCKED(&xobj->base);
         return ret;
 out0:
@@ -349,14 +333,6 @@ int xocl_create_sgl_bo_ifc(struct drm_xocl_sgl_bo *args)
                 for_each_sg((struct scatterlist *)args->sgl, sg, nents, i) {
                         xobj->pages[i] = sg_page(sg);
                 }
-
-                /* TODO: resolve the cache issue */
-                xobj->vmapping = vmap(xobj->pages, nents, VM_MAP, PAGE_KERNEL);
-		
-		if (!xobj->vmapping) {
-                        ret = -ENOMEM;
-                        goto out0;
-        	}
         }
 	else{
 		xobj->sgt = NULL;
@@ -433,14 +409,6 @@ int xocl_remap_sgl_bo_ifc(struct drm_xocl_sgl_bo *args)
 
 	for_each_sg((struct scatterlist *)args->sgl, sg, nents, i) {
 		xobj->pages[i] = sg_page(sg);
-	}
-
-	/* TODO: resolve the cache issue */
-	xobj->vmapping = vmap(xobj->pages, nents, VM_MAP, PAGE_KERNEL);
-
-	if (!xobj->vmapping) {
-		ret = -ENOMEM;
-                goto out0;
 	}
 
 	XOCL_DRM_GEM_OBJECT_PUT_UNLOCKED(&xobj->base);

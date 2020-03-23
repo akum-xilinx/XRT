@@ -94,7 +94,7 @@ static ssize_t xdma_migrate_bo(struct platform_device *pdev,
 		if (!pg)
 			continue;
 		pgaddr = page_to_phys(pg);
-		xocl_err(&pdev->dev, "%i, 0x%llx\n", i, pgaddr);
+		xocl_err(&pdev->dev, "%i, phy:0x%llx, pg:0x%llx virt:0x%llx\n", i, pgaddr, pg, page_to_virt(pg));
 	}
 	return ret;
 }
