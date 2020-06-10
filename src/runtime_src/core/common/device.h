@@ -1,5 +1,5 @@
 /**
- * Copyright (C) 2019 Xilinx, Inc
+ * Copyright (C) 2019-2020 Xilinx, Inc
  *
  * Licensed under the Apache License, Version 2.0 (the "License"). You may
  * not use this file except in compliance with the License. A copy of the
@@ -22,16 +22,20 @@
 #include "error.h"
 #include "ishim.h"
 #include "scope_guard.h"
-#include "xrt.h"
+#include "uuid.h"
+#include "core/include/xrt.h"
 
 // Please keep eternal include file dependencies to a minimum
 #include <cstdint>
 #include <vector>
 #include <string>
+#include <map>
 #include <boost/any.hpp>
 #include <boost/property_tree/ptree.hpp>
 
 namespace xrt_core {
+
+using device_collection = std::vector<std::shared_ptr<xrt_core::device>>;
 
 /**
  * class device - interface to support OS agnositic operations on a device
@@ -43,6 +47,7 @@ public:
   // device index type
   using id_type = unsigned int;
   using handle_type = xclDeviceHandle;
+
 public:
 
   XRT_CORE_COMMON_EXPORT
@@ -65,26 +70,49 @@ public:
 
   /**
    * get_device_handle() - Get underlying shim device handle
-   *
-   * Throws if called on non userof devices
    */
   virtual handle_type
   get_device_handle() const = 0;
 
+  /**
+   * get_mgmt_handle() - Get underlying mgmt device handle if any
+   *
+   * Return: Handle for mgmt device, or XRT_NULL_HANDLE if undefined
+   *
+   * Currently windows is only OS that differentiates mgmt handle from
+   * device handle.  As such this function really doesn't belong here
+   * in base class, but it avoids dynamic_cast from base device to
+   * concrete device for query calls.
+   */
   virtual handle_type
   get_mgmt_handle() const
   {
     return XRT_NULL_HANDLE;
   }
 
+  /**
+   * get_user_handle() - Get underlying user device handle if any
+   *
+   * Return: Handle for user device.
+   *
+   * User the device is default the same as device handle.
+   */
   virtual handle_type
   get_user_handle() const
   {
-    return XRT_NULL_HANDLE;
+    return get_device_handle();
   }
 
   /**
    * is_userpf_device() - Is this device a userpf
+   *
+   * Return: true if this device is associate with userpf, false otherwise
+   *
+   * This currently makes sense only on Linux.  It used by
+   * device_linux to direct sysfs calls to the proper pf.  As such
+   * this function really doesn't belong here in base class, but it
+   * avoids dynamic_cast from base device to concrete device for
+   * query calls.
    */
   virtual bool
   is_userpf() const
@@ -142,31 +170,120 @@ public:
     return qr.get(this, std::forward<Args>(args)...);
   }
 
-  virtual void get_info(boost::property_tree::ptree &pt) const = 0;
-  virtual void read_dma_stats(boost::property_tree::ptree &pt) const = 0;
+  /**
+   * register_axlf() - Callback from shim after AXLF has been loaded.
+   *
+   * This function extracts meta data sections as needed.
+   */
+  XRT_CORE_COMMON_EXPORT
+  void
+  register_axlf(const axlf*);
 
+  /**
+   * get_xclbin_uuid() - Get uuid of currently loaded xclbin
+   */
+  uuid
+  get_xclbin_uuid() const;
+
+  /**
+   * get_axlf_section() - Get section from currently loaded axlf
+   *
+   * xclbin_id:  Check that xclbin_id matches currently cached
+   * Return:     Pair of section data and size in bytes
+   *
+   * This function provides access to meta data sections that are
+   * from currently loaded xclbin.  The returned section is from when the
+   * xclbin was loaded by this process.  The function cannot be used
+   * unless this process loaded the xclbin.
+   *
+   * The function returns {nullptr, 0} if section is not cached.
+   *
+   * Same behavior as other get_axlf_section()
+   */
+  XRT_CORE_COMMON_EXPORT
+  std::pair<const char*, size_t>
+  get_axlf_section(axlf_section_kind section, const uuid& xclbin_id = uuid()) const;
+
+  std::pair<const char*, size_t>
+  get_axlf_section_or_error(axlf_section_kind section, const uuid& xclbin_id = uuid()) const;
+
+  template<typename SectionType>
+  SectionType
+  get_axlf_section(axlf_section_kind section, const uuid& xclbin_id = uuid()) const
+  {
+    return reinterpret_cast<SectionType>(get_axlf_section(section, xclbin_id));
+  }
+
+  template<typename SectionType>
+  SectionType
+  get_axlf_section_or_error(axlf_section_kind section, const uuid& xclbin_id = uuid()) const
+  {
+    return reinterpret_cast<SectionType>(get_axlf_section_or_error(section, xclbin_id));
+  }
+
+  /**
+   * get_ert_slots() - Get number of ERT CQ slots
+   *
+   * Returns: Pair of number of slots and size of each slot
+   */
+  XRT_CORE_COMMON_EXPORT
+  std::pair<size_t, size_t>
+  get_ert_slots(const char* xml, size_t xml_size) const;
+
+  XRT_CORE_COMMON_EXPORT
+  std::pair<size_t, size_t>
+  get_ert_slots() const;
+
+  // Move all these 'pt' functions out the class interface
+  virtual void get_info(boost::property_tree::ptree&) const {}
+  virtual void read_dma_stats(boost::property_tree::ptree&) const {}
+
+  XRT_CORE_COMMON_EXPORT
   void get_rom_info(boost::property_tree::ptree & pt) const;
+
+  XRT_CORE_COMMON_EXPORT
   void get_xmc_info(boost::property_tree::ptree & pt) const;
+
+  XRT_CORE_COMMON_EXPORT
   void get_platform_info(boost::property_tree::ptree & pt) const;
+
+  XRT_CORE_COMMON_EXPORT
   void read_thermal_pcb(boost::property_tree::ptree &pt) const;
+
+  XRT_CORE_COMMON_EXPORT
   void read_thermal_fpga(boost::property_tree::ptree &pt) const;
+
+  XRT_CORE_COMMON_EXPORT
   void read_fan_info(boost::property_tree::ptree &pt) const;
+
+  XRT_CORE_COMMON_EXPORT
   void read_thermal_cage(boost::property_tree::ptree &pt) const;
+
+  XRT_CORE_COMMON_EXPORT
   void read_electrical(boost::property_tree::ptree &pt) const;
+
+  XRT_CORE_COMMON_EXPORT
   void read_power(boost::property_tree::ptree &pt) const;
+
+  XRT_CORE_COMMON_EXPORT
   void read_firewall(boost::property_tree::ptree &pt) const;
 
   /**
    * read() - maps pcie bar and copy bytes word (32bit) by word
+   * THIS FUNCTION DOES NOT BELONG HERE
    */
-  virtual void read(uint64_t offset, void* buf, uint64_t len) const = 0;
+  virtual void read(uint64_t, void*, uint64_t) const {}
   /**
    * write() - maps pcie bar and copy bytes word (32bit) by word
+   * THIS FUNCTION DOES NOT BELONG HERE
    */
-  virtual void write(uint64_t offset, const void* buf, uint64_t len) const = 0;
+  virtual void write(uint64_t, const void*, uint64_t) const {}
+
+  virtual void reset(const char*, const char*, const char*) const {}
 
   /**
    * file_open() - Opens a scoped fd
+   * THIS FUNCTION DOES NOT BELONG HERE
    */
   scope_value_guard<int, std::function<void()>>
   file_open(const std::string& subdev, int flag)
@@ -175,7 +292,7 @@ public:
     return {fd, std::bind(&device::close, this, fd)};
   }
 
-  // Helper methods
+  // Helper methods, move else where
   typedef std::string (*FORMAT_STRING_PTR)(const boost::any &);
   static std::string format_primative(const boost::any & _data);
   static std::string format_hex(const boost::any & _data);
@@ -185,7 +302,10 @@ public:
 
  private:
   id_type m_device_id;
-  const axlf* xclbin = nullptr;
+
+  // cache xclbin meta data loaded by this process
+  uuid m_xclbin_uuid;
+  std::map<axlf_section_kind, std::vector<char>> m_axlf_sections;
 };
 
 /**
@@ -196,7 +316,7 @@ public:
  */
 
 template <typename QueryRequestType>
-static typename QueryRequestType::result_type
+inline typename QueryRequestType::result_type
 device_query(const device* device)
 {
   auto ret = device->query<QueryRequestType>();
@@ -204,14 +324,14 @@ device_query(const device* device)
 }
 
 template <typename QueryRequestType>
-static typename QueryRequestType::result_type
+inline typename QueryRequestType::result_type
 device_query(const std::shared_ptr<device>& device)
 {
   return device_query<QueryRequestType>(device.get());
 }
 
 template <typename QueryRequestType, typename ...Args>
-static typename QueryRequestType::result_type
+inline typename QueryRequestType::result_type
 device_query(const std::shared_ptr<device>& device, Args&&... args)
 {
   return device_query<QueryRequestType>(device.get(), std::forward<Args>(args)...);

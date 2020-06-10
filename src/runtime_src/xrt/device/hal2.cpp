@@ -14,21 +14,33 @@
  * under the License.
  */
 #include "hal2.h"
-#include "xrt/util/thread.h"
 #include "ert.h"
 #include "core/common/system.h"
 #include "core/common/device.h"
 #include "core/common/query_requests.h"
+#include "core/common/thread.h"
 
 #include <boost/format.hpp>
 #include <cstring> // for std::memcpy
 #include <iostream>
 #include <cerrno>
 #include <regex>
+#include <cstdlib>
 
 #ifdef _WIN32
 # pragma warning( disable : 4267 4996 4244 4245 )
 #endif
+
+namespace {
+
+static bool
+is_emulation()
+{
+  static bool val = (std::getenv("XCL_EMULATION_MODE") != nullptr);
+  return val;
+}
+
+}
 
 namespace xrt { namespace hal2 {
 
@@ -41,11 +53,25 @@ device(std::shared_ptr<operations> ops, unsigned int idx)
 device::
 ~device()
 {
-  close();
+  if (is_emulation())
+    // xsim will not shutdown unless there is a guaranteed call to xclClose
+    close();  
+  
   for (auto& q : m_queue)
     q.stop();
   for (auto& t : m_workers)
     t.join();
+}
+
+void
+device::
+close()
+{
+  std::lock_guard<std::mutex> lk(m_mutex);
+  if (m_handle) {
+    m_ops->mClose(m_handle);
+    m_handle=nullptr;
+  }
 }
 
 std::ostream&
@@ -81,7 +107,7 @@ void
 device::
 setup()
 {
-#ifndef PMD_OCL
+  std::lock_guard<std::mutex> lk(m_mutex);
   if (!m_workers.empty())
     return;
 
@@ -98,12 +124,11 @@ setup()
   XRT_DEBUG(std::cout,"Creating ",2*threads," DMA worker threads\n");
   for (unsigned int i=0; i<threads; ++i) {
     // read and write queue workers
-    m_workers.emplace_back(xrt::thread(task::worker2,std::ref(m_queue[static_cast<qtype>(hal::queue_type::read)]),"read"));
-    m_workers.emplace_back(xrt::thread(task::worker2,std::ref(m_queue[static_cast<qtype>(hal::queue_type::write)]),"write"));
+    m_workers.emplace_back(xrt_core::thread(task::worker2,std::ref(m_queue[static_cast<qtype>(hal::queue_type::read)]),"read"));
+    m_workers.emplace_back(xrt_core::thread(task::worker2,std::ref(m_queue[static_cast<qtype>(hal::queue_type::write)]),"write"));
   }
   // single misc queue worker
-  m_workers.emplace_back(xrt::thread(task::worker2,std::ref(m_queue[static_cast<qtype>(hal::queue_type::misc)]),"misc"));
-#endif
+  m_workers.emplace_back(xrt_core::thread(task::worker2,std::ref(m_queue[static_cast<qtype>(hal::queue_type::misc)]),"misc"));
 }
 
 device::BufferObject*
@@ -263,13 +288,13 @@ alloc(size_t sz, Domain domain, uint64_t memory_index, void* userptr)
   }
   else {
     uint64_t flags = memory_index;
-    if(domain==Domain::XRT_DEVICE_ONLY_MEM_P2P) {
+    if(domain==Domain::XRT_DEVICE_ONLY_MEM_P2P)
       flags |= XCL_BO_FLAGS_P2P;
-    } else if (domain == Domain::XRT_DEVICE_ONLY_MEM) {
+    else if (domain == Domain::XRT_DEVICE_ONLY_MEM)
       flags |= XCL_BO_FLAGS_DEV_ONLY;
-    } else if (domain == Domain::XRT_HOST_ONLY_MEM) {
+    else if (domain == Domain::XRT_HOST_ONLY_MEM)
       flags |= XCL_BO_FLAGS_HOST_ONLY;
-    } else
+    else
       flags |= XCL_BO_FLAGS_CACHEABLE;
 
     if (userptr)
@@ -579,6 +604,7 @@ void
 device::
 emplaceSVMBufferObjectMap(const BufferObjectHandle& boh, void* ptr)
 {
+  std::lock_guard<std::mutex> lk(m_mutex);
   auto itr = m_svmbomap.find(ptr);
   if (itr == m_svmbomap.end())
     m_svmbomap[ptr] = boh;
@@ -588,6 +614,7 @@ void
 device::
 eraseSVMBufferObjectMap(void* ptr)
 {
+  std::lock_guard<std::mutex> lk(m_mutex);
   auto itr = m_svmbomap.find(ptr);
   if (itr != m_svmbomap.end())
     m_svmbomap.erase(itr);
@@ -597,6 +624,7 @@ BufferObjectHandle
 device::
 svm_bo_lookup(void* ptr)
 {
+  std::lock_guard<std::mutex> lk(m_mutex);
   auto itr = m_svmbomap.find(ptr);
   if (itr != m_svmbomap.end())
     return (*itr).second;
@@ -704,23 +732,29 @@ pollStreams(hal::StreamXferCompletions* comps, int min, int max, int* actual, in
   return m_ops->mPollQueues(m_handle,min,max,req,actual,timeout);
 }
 
-#ifdef PMD_OCL
-void
-createDevices(hal::device_list& devices,
-              const std::string& dll, void* handle, unsigned int count, void* pmd)
+int
+device::
+pollStream(hal::StreamHandle stream, hal::StreamXferCompletions* comps, int min, int max, int* actual, int timeout)
 {
-  assert(0);
+  xclReqCompletion* req = reinterpret_cast<xclReqCompletion*>(comps);
+  return m_ops->mPollQueue(m_handle,stream,min,max,req,actual,timeout);
 }
-#else
+
+int
+device::
+setStreamOpt(hal::StreamHandle stream, int type, uint32_t val)
+{
+  return m_ops->mSetQueueOpt(m_handle,stream,type,val);
+}
+
 void
 createDevices(hal::device_list& devices,
-              const std::string& dll, void* driverHandle, unsigned int deviceCount,void*)
+              const std::string& dll, void* driverHandle, unsigned int deviceCount)
 {
   auto halops = std::make_shared<operations>(dll,driverHandle,deviceCount);
   for (unsigned int idx=0; idx<deviceCount; ++idx)
     devices.emplace_back(std::make_unique<xrt::hal2::device>(halops,idx));
 }
-#endif
 
 
 }} // hal2,xrt

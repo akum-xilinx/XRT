@@ -16,12 +16,6 @@
  */
 
 #include <linux/version.h>
-#if LINUX_VERSION_CODE <= KERNEL_VERSION(3, 0, 0)
-#include <drm/drm_backport.h>
-#endif
-#include <drm/drmP.h>
-#include <drm/drm_gem.h>
-#include <drm/drm_mm.h>
 #include <linux/eventfd.h>
 #include <linux/uuid.h>
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 7, 0)
@@ -29,6 +23,8 @@
 #endif
 #include "version.h"
 #include "common.h"
+
+extern int kds_mode;
 
 #if defined(XOCL_UUID)
 xuid_t uuid_null = NULL_UUID_LE;
@@ -62,8 +58,12 @@ int xocl_execbuf_ioctl(struct drm_device *dev,
 	struct xocl_drm *drm_p = dev->dev_private;
 	int ret = 0;
 
-	ret = xocl_exec_client_ioctl(drm_p->xdev,
-		       DRM_XOCL_EXECBUF, data, filp);
+	if (kds_mode == 1)
+		ret = xocl_client_ioctl(drm_p->xdev,
+					DRM_XOCL_EXECBUF, data, filp);
+	else
+		ret = xocl_exec_client_ioctl(drm_p->xdev,
+					     DRM_XOCL_EXECBUF, data, filp);
 
 	return ret;
 }
@@ -79,8 +79,12 @@ int xocl_ctx_ioctl(struct drm_device *dev, void *data,
 	struct xocl_drm *drm_p = dev->dev_private;
 	int ret = 0;
 
-	ret = xocl_exec_client_ioctl(drm_p->xdev,
-		       DRM_XOCL_CTX, data, filp);
+	if (kds_mode == 1)
+		ret = xocl_client_ioctl(drm_p->xdev,
+					DRM_XOCL_CTX, data, filp);
+	else
+		ret = xocl_exec_client_ioctl(drm_p->xdev,
+					     DRM_XOCL_CTX, data, filp);
 
 	return ret;
 }
@@ -194,10 +198,10 @@ xocl_read_sect(enum axlf_section_kind kind, void **sect, struct axlf *axlf_full)
 static uint live_clients(struct xocl_dev *xdev, pid_t **plist)
 {
 	const struct list_head *ptr;
-	const struct client_ctx *entry;
 	uint count = 0;
 	uint i = 0;
 	pid_t *pl = NULL;
+	const struct client_ctx *entry;
 
 	BUG_ON(!mutex_is_locked(&xdev->dev_lock));
 
@@ -229,13 +233,18 @@ out:
 	return count;
 }
 
+/* TODO: Move to xocl_kds.c, when start to create sysfs nodes for new kds. */
 u32 get_live_clients(struct xocl_dev *xdev, pid_t **plist)
 {
 	u32 c;
 
-	mutex_lock(&xdev->dev_lock);
-	c = live_clients(xdev, plist);
-	mutex_unlock(&xdev->dev_lock);
+	if (kds_mode) {
+		c = xocl_kds_live_clients(xdev, plist);
+	} else {
+		mutex_lock(&xdev->dev_lock);
+		c = live_clients(xdev, plist);
+		mutex_unlock(&xdev->dev_lock);
+	}
 
 	return c;
 }
@@ -259,20 +268,21 @@ static bool xclbin_downloaded(struct xocl_dev *xdev, xuid_t *xclbin_id)
 	return ret;
 }
 
-static int xocl_preserve_mem(struct xocl_dev *xdev, struct mem_topology *new_topology, size_t size)
+static int xocl_preserve_mem(struct xocl_drm *drm_p, struct mem_topology *new_topology, size_t size)
 {
 	int ret = 0;
 	struct mem_topology *topology = NULL;
+	struct xocl_dev *xdev = drm_p->xdev;
 
 	ret = XOCL_GET_MEM_TOPOLOGY(xdev, topology);
 	if (ret)
-		return ret;
+		return 0;
 
 	/*
 	 * Compare MEM_TOPOLOGY previous vs new.
 	 * Ignore this and keep disable preserve_mem if not for aws.
 	 */
-	if (xocl_is_aws(xdev) && (topology != NULL)) {
+	if (xocl_icap_get_data(xdev, DATA_RETAIN) && (topology != NULL) && drm_p->mm) {
 		if ((size == sizeof_sect(topology, m_mem_data)) &&
 		    !memcmp(new_topology, topology, size)) {
 			userpf_info(xdev, "preserving mem_topology.");
@@ -320,6 +330,37 @@ xocl_read_axlf_helper(struct xocl_drm *drm_p, struct drm_xocl_axlf *axlf_ptr)
 		goto done;
 
 	/*
+	 * Coupling scheduler(context, exec BOs) at this place is a bad idea.
+	 *
+	 * The load xclbin and lock xclbin operation are separated.
+	 * The xclbin was locked until a context was opened and unlocked until
+	 * all of the contexts were closed.
+	 * If some processes are downloading the same xclbin. Only the first
+	 * one could reach below lines.
+	 * If some processes are downloading different xclbins. The second one
+	 * got dev_lock could go here.  Let's see if ICAP could protect the
+	 * sequence of download xclbin and open context on downloaded xclbin.
+	 *
+	 * If open context locked bitstream, xocl_icap_download_axlf() would
+	 * failed later on, since the bitstream is busy.
+	 * If xocl_icap_download_axlf() successed, open context on prev xclbin
+	 * would fail. This is the same as current implementation. This is the
+	 * cost that we have to pay if we are not able to lock xclbin after
+	 * loaded it.
+	 *
+	 * After all, ICAP subdevice does everything to protect xclbin. If
+	 * scheduler is ready to work on a new xclbin, like all of contexts are
+	 * closed, it should only notice ICAP not here.
+	 *
+	 * "Note that icap subdevice also maintains xclbin ref count, which is
+	 * used to lock down xclbin on mgmt pf side."
+	 * I found this statement is not correct anymore. The ref count is using
+	 * on user pf side.
+	 */
+	if (kds_mode)
+		goto skip1;
+
+	/*
 	 * Support for multiple processes
 	 * 1. We lock &xdev->dev_lock so no new contexts can be opened and no
 	 *    live contexts can be closed
@@ -337,6 +378,7 @@ xocl_read_axlf_helper(struct xocl_drm *drm_p, struct drm_xocl_axlf *axlf_ptr)
 		goto done;
 	}
 
+skip1:
 	/* Really need to download, sanity check xclbin, first. */
 	if (xocl_xrt_version_check(xdev, &bin_obj, true)) {
 		userpf_err(xdev, "Xclbin isn't supported by current XRT\n");
@@ -411,7 +453,7 @@ xocl_read_axlf_helper(struct xocl_drm *drm_p, struct drm_xocl_axlf *axlf_ptr)
 		goto done;
 	}
 
-	preserve_mem = xocl_preserve_mem(xdev, new_topology, size);
+	preserve_mem = xocl_preserve_mem(drm_p, new_topology, size);
 
 	/* Switching the xclbin, make sure none of the buffers are used. */
 	if (!preserve_mem) {
@@ -422,22 +464,20 @@ xocl_read_axlf_helper(struct xocl_drm *drm_p, struct drm_xocl_axlf *axlf_ptr)
 
 	err = xocl_icap_download_axlf(xdev, axlf);
 	if (err) {
+		/* TODO: remove this. Coupling scheduler is a bad idea.
+		 */
 		/*
 		 * We have to clear uuid cached in scheduler here if
 		 * download xclbin failed
 		 */
-		(void) xocl_exec_reset(xdev, &uuid_null);
+		if (kds_mode)
+			(void) xocl_kds_reset(xdev, &uuid_null);
+		else
+			(void) xocl_exec_reset(xdev, &uuid_null);
 		/*
 		 * Don't just bail out here, always recreate drm mem
 		 * since we have cleaned it up before download.
 		 */
-	}
-	/* work around vivado issue. Resize p2p bar after xclbin download */
-	if (xdev->core.priv.p2p_bar_sz > 0 && xdev->p2p_bar_idx >= 0 &&
-	    xdev->p2p_bar_len > (1 << XOCL_P2P_CHUNK_SHIFT) &&
-	    xocl_get_p2p_bar(xdev, NULL) >= 0) {
-		(void) xocl_pci_rbar_refresh(xdev->core.pdev,
-				xdev->p2p_bar_idx);
 	}
 
 	if (!preserve_mem) {
@@ -449,8 +489,10 @@ xocl_read_axlf_helper(struct xocl_drm *drm_p, struct drm_xocl_axlf *axlf_ptr)
 done:
 	if (size < 0)
 		err = size;
-	if (err)
+	if (err){
+		xocl_icap_clean_bitstream(xdev);
 		userpf_err(xdev, "Failed to download xclbin, err: %ld\n", err);
+	}
 	else
 		userpf_info(xdev, "Loaded xclbin %pUb", &bin_obj.m_header.uuid);
 
@@ -510,7 +552,7 @@ int xocl_alloc_cma_ioctl(struct drm_device *dev, void *data,
 	int err = 0;
 
 	mutex_lock(&xdev->dev_lock);
-	err = xocl_cma_chunk_alloc_helper(drm_p, cma_info);
+	err = xocl_cma_bank_alloc(drm_p, cma_info);
 	mutex_unlock(&xdev->dev_lock);
 	return err;
 }
@@ -518,15 +560,18 @@ int xocl_alloc_cma_ioctl(struct drm_device *dev, void *data,
 int xocl_free_cma_ioctl(struct drm_device *dev, void *data,
 	struct drm_file *filp)
 {
-	struct drm_xocl_free_cma_info *cma_info = data;
 	struct xocl_drm *drm_p = dev->dev_private;
 	struct xocl_dev *xdev = drm_p->xdev;
+	int err = 0;
 
 	mutex_lock(&xdev->dev_lock);
-	xocl_cma_chunk_free_helper(drm_p, cma_info);
+	if (xocl_addr_translator_get_base_addr(xdev))
+		err = -EBUSY;
+	else
+		xocl_cma_bank_free(drm_p);
 	mutex_unlock(&xdev->dev_lock);
 
-	return 0;
+	return err;
 }
 
 extern struct xocl_drm_dev_info uapp_drm_context;

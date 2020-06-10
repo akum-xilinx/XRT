@@ -15,9 +15,9 @@ target_link_libraries(xbmgmt
   xrt_core_static
   xrt_coreutil_static
   pthread
-  boost_filesystem
-  boost_system
+  ${Boost_FILESYSTEM_LIBRARY}
+  ${Boost_SYSTEM_LIBRARY}
   uuid
   )
 
-install (TARGETS xbmgmt RUNTIME DESTINATION ${XRT_INSTALL_DIR}/bin)
+install (TARGETS xbmgmt RUNTIME DESTINATION ${XRT_INSTALL_UNWRAPPED_DIR})

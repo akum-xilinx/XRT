@@ -1,8 +1,9 @@
+/* SPDX-License-Identifier: GPL-2.0 OR Apache-2.0 */
 /*
  * A GEM style (optionally CMA backed) device manager for ZynQ based
  * OpenCL accelerators.
  *
- * Copyright (C) 2016-2019 Xilinx, Inc. All rights reserved.
+ * Copyright (C) 2016-2020 Xilinx, Inc. All rights reserved.
  *
  * Authors:
  *    Sonal Santan <sonal.santan@xilinx.com>
@@ -10,16 +11,11 @@
  *    Min Ma       <min.ma@xilinx.com>
  *    Jan Stephan  <j.stephan@hzdr.de>
  *
- * This software is licensed under the terms of the GNU General Public
- * License version 2, as published by the Free Software Foundation, and
- * may be copied, distributed, and modified under those terms.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * This file is dual-licensed; you may select either the GNU General Public
+ * License version 2 or Apache License, Version 2.0.
  */
 
+#include <linux/delay.h>
 #include <linux/dma-buf.h>
 #include <linux/module.h>
 #include <linux/fpga/fpga-mgr.h>
@@ -29,6 +25,7 @@
 #include <linux/kernel.h>
 #include <linux/of_address.h>
 #include <linux/of_irq.h>
+#include <linux/poll.h>
 #include <linux/spinlock.h>
 #include "zocl_drv.h"
 #include "zocl_sk.h"
@@ -53,6 +50,8 @@
 #ifndef VM_RESERVED
 #define VM_RESERVED (VM_DONTEXPAND | VM_DONTDUMP)
 #endif
+
+extern int kds_mode;
 
 static const struct vm_operations_struct reg_physical_vm_ops = {
 #ifdef CONFIG_HAVE_IOREMAP_PROT
@@ -80,19 +79,6 @@ void zocl_free_sections(struct drm_zocl_dev *zdev)
 	}
 }
 
-/* Note: this function is not being used, mark it inline to make lint clean */
-static inline irqreturn_t zocl_h2c_isr(int irq, void *arg)
-{
-	void *mmio_sched = arg;
-
-	DRM_INFO("IRQ number is %d -->\n", irq);
-	mmio_sched = mmio_sched + 0x58;
-	DRM_INFO("mmio_sched is 0x%x\n", ioread32(mmio_sched));
-	mmio_sched = mmio_sched - 0x58;
-	DRM_INFO("<-- IRQ handler\n");
-	return IRQ_HANDLED;
-}
-
 #if KERNEL_VERSION(5, 3, 0) <= LINUX_VERSION_CODE
 static int
 match_name(struct device *dev, const void *data)
@@ -107,27 +93,6 @@ match_name(struct device *dev, void *data)
 	 * the dev_name is like: 20300030000.ert_hw
 	 */
 	return strstr(dev_name(dev), name) != NULL;
-}
-
-/**
- * find_pdev - Find platform device by name
- *
- * @name: device name
- *
- * Returns a platform device. Returns NULL if not found.
- */
-static struct platform_device *find_pdev(char *name)
-{
-	struct device *dev;
-	struct platform_device *pdev;
-
-	dev = bus_find_device(&platform_bus_type, NULL, (void *)name,
-	    match_name);
-	if (!dev)
-		return NULL;
-
-	pdev = container_of(dev, struct platform_device, dev);
-	return pdev;
 }
 
 /**
@@ -153,6 +118,27 @@ static int get_reserved_mem_region(struct device *dev, struct resource *res)
 		return -EINVAL;
 
 	return 0;
+}
+
+/**
+ * zocl_find_pdev - Find platform device by name
+ *
+ * @name: device name
+ *
+ * Returns a platform device. Returns NULL if not found.
+ */
+struct platform_device *zocl_find_pdev(char *name)
+{
+	struct device *dev;
+	struct platform_device *pdev;
+
+	dev = bus_find_device(&platform_bus_type, NULL, (void *)name,
+	    match_name);
+	if (!dev)
+		return NULL;
+
+	pdev = container_of(dev, struct platform_device, dev);
+	return pdev;
 }
 
 /**
@@ -224,6 +210,78 @@ int get_apt_index_by_cu_idx(struct drm_zocl_dev *zdev, int cu_idx)
 			break;
 
 	return (i == zdev->num_apts) ? -EINVAL : i;
+}
+
+int subdev_create_cu(struct drm_zocl_dev *zdev, struct xrt_cu_info *info)
+{
+	struct platform_device *pldev;
+	struct resource res;
+	int ret;
+
+	pldev = platform_device_alloc("CU", PLATFORM_DEVID_AUTO);
+	if (!pldev) {
+		DRM_ERROR("Failed to alloc device CU\n");
+		return -ENOMEM;
+	}
+
+	/* hard code resource
+	 * TODO: maybe we should define resource in a header file
+	 */
+	/* zdev->res_start provides higher 32 bits address */
+	res.start = zdev->res_start + info->addr;
+	res.end = res.start + 0xFFFF;
+	res.flags = IORESOURCE_MEM;
+	res.parent = NULL;
+	ret = platform_device_add_resources(pldev, &res, 1);
+	if (ret) {
+		DRM_ERROR("Failed to add resource\n");
+		goto err;
+	}
+
+	ret = platform_device_add_data(pldev, info, sizeof(*info));
+	if (ret) {
+		DRM_ERROR("Failed to add data\n");
+		goto err;
+	}
+
+	pldev->dev.parent = zdev->ddev->dev;
+
+	ret = platform_device_add(pldev);
+	if (ret) {
+		DRM_ERROR("Failed to add device\n");
+		goto err;
+	}
+
+	/*
+	 * force probe to avoid dependence issue. if probing
+	 * failed, it could be the driver is not registered.
+	 */
+	ret = device_attach(&pldev->dev);
+	if (ret != 1) {
+		DRM_ERROR("Failed to probe device\n");
+		goto err1;
+	}
+	zdev->cu_pldev[info->inst_idx] = pldev;
+
+	return 0;
+err1:
+	platform_device_del(pldev);
+err:
+	platform_device_put(pldev);
+	return ret;
+}
+
+void subdev_destroy_cu(struct drm_zocl_dev *zdev)
+{
+	int i;
+
+	for (i = 0; i < MAX_CU_NUM; ++i) {
+		if (!zdev->cu_pldev[i])
+			continue;
+		platform_device_del(zdev->cu_pldev[i]);
+		platform_device_put(zdev->cu_pldev[i]);
+		zdev->cu_pldev[i] = NULL;
+	}
 }
 
 /**
@@ -434,7 +492,7 @@ static int zocl_mmap(struct file *filp, struct vm_area_struct *vma)
 	 * Still use this approach before it requires to support hardware
 	 * address mapping from higher than 4GB space.
 	 */
-	if (!zdev->exec->configured) {
+	if (kds_mode == 0 && !zdev->exec->configured) {
 		DRM_ERROR("Schduler is not configured\n");
 		return -EINVAL;
 	}
@@ -501,32 +559,46 @@ static vm_fault_t zocl_bo_fault(struct vm_fault *vmf)
 static int zocl_client_open(struct drm_device *dev, struct drm_file *filp)
 {
 	struct sched_client_ctx *fpriv = kzalloc(sizeof(*fpriv), GFP_KERNEL);
+	int ret = 0;
 
 	if (!fpriv)
 		return -ENOMEM;
 
-	filp->driver_priv = fpriv;
-	mutex_init(&fpriv->lock);
-	atomic_set(&fpriv->trigger, 0);
-	atomic_set(&fpriv->outstanding_execs, 0);
-	fpriv->abort = false;
-	fpriv->pid = get_pid(task_pid(current));
-	zocl_track_ctx(dev, fpriv);
-	DRM_INFO("Pid %d opened device\n", pid_nr(task_tgid(current)));
-	return 0;
+	if (kds_mode == 1) {
+		kfree(fpriv);
+		ret = zocl_create_client(dev->dev_private, &filp->driver_priv);
+	} else {
+		filp->driver_priv = fpriv;
+		mutex_init(&fpriv->lock);
+		atomic_set(&fpriv->trigger, 0);
+		atomic_set(&fpriv->outstanding_execs, 0);
+		fpriv->abort = false;
+		fpriv->pid = get_pid(task_pid(current));
+		zocl_track_ctx(dev, fpriv);
+		DRM_INFO("Pid %d opened device\n", pid_nr(task_tgid(current)));
+	}
+
+	return ret;
 }
 
 static void zocl_client_release(struct drm_device *dev, struct drm_file *filp)
 {
 	struct sched_client_ctx *client = filp->driver_priv;
 	struct drm_zocl_dev *zdev = dev->dev_private;
-	int pid = pid_nr(client->pid);
+	int pid;
 	u32 outstanding = 0;
 	int retry = 20;
 	int i;
 
+	if (kds_mode == 1) {
+		zocl_destroy_client(dev->dev_private, &filp->driver_priv);
+		return;
+	}
+
 	if (!client)
 		return;
+
+	pid = pid_nr(client->pid);
 
 	/* force scheduler to abort scheduled cmds for this client */
 	client->abort = true;
@@ -555,9 +627,7 @@ static void zocl_client_release(struct drm_device *dev, struct drm_file *filp)
 	 * contexts. Give up contexts and release xclbin.
 	 */
 	client->num_cus = 0;
-	mutex_lock(&zdev->zdev_xclbin_lock);
-	(void) zocl_xclbin_release(zdev);
-	mutex_unlock(&zdev->zdev_xclbin_lock);
+	(void) zocl_unlock_bitstream(zdev, &uuid_null);
 done:
 	zocl_untrack_ctx(dev, client);
 	kfree(client);
@@ -575,6 +645,9 @@ static unsigned int zocl_poll(struct file *filp, poll_table *wait)
 	int ret = 0;
 
 	BUG_ON(!fpriv);
+
+	if (kds_mode == 1)
+		return zocl_poll_client(filp, wait);
 
 	poll_wait(filp, &zdev->exec->poll_wait_queue, wait);
 
@@ -668,7 +741,11 @@ static const struct file_operations zocl_driver_fops = {
 };
 
 static struct drm_driver zocl_driver = {
+#if KERNEL_VERSION(5, 4, 0) > LINUX_VERSION_CODE
 	.driver_features           = DRIVER_GEM | DRIVER_PRIME | DRIVER_RENDER,
+#else
+	.driver_features           = DRIVER_GEM | DRIVER_RENDER,
+#endif
 	.open                      = zocl_client_open,
 	.postclose                 = zocl_client_release,
 	.gem_free_object           = zocl_free_bo,
@@ -734,6 +811,7 @@ static int zocl_drm_platform_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	zdev->zdev_data_info = id->data;
+	INIT_LIST_HEAD(&zdev->ctx_list);
 
 	/* Record and get IRQ number */
 	for (index = 0; index < MAX_CU_NUM; index++) {
@@ -759,7 +837,7 @@ static int zocl_drm_platform_probe(struct platform_device *pdev)
 	}
 	mutex_init(&zdev->mm_lock);
 
-	subdev = find_pdev("ert_hw");
+	subdev = zocl_find_pdev("ert_hw");
 	if (subdev) {
 		DRM_INFO("ert_hw found: 0x%llx\n", (uint64_t)(uintptr_t)subdev);
 		/* Trust device tree for now, but a better place should be
@@ -779,7 +857,7 @@ static int zocl_drm_platform_probe(struct platform_device *pdev)
 	 * For PR platform, the FPGA manager is required. No good way to
 	 * determin if it is a PR platform at probe.
 	 */
-	fnode = of_get_child_by_name(of_root,
+	fnode = of_find_node_by_name(of_root,
 	    zdev->zdev_data_info->fpga_driver_name);
 	if (fnode) {
 		zdev->fpga_mgr = of_fpga_mgr_get(fnode);
@@ -845,14 +923,25 @@ static int zocl_drm_platform_probe(struct platform_device *pdev)
 		goto err_sysfs;
 
 	/* Now initial kds */
-	ret = sched_init_exec(drm);
-	if (ret)
-		goto err_sched;
+	if (kds_mode == 1) {
+		ret = cu_ctrl_init(zdev);
+		if (ret)
+			goto err_cu_ctrl;
+		ret = zocl_init_sched(zdev);
+		if (ret)
+			goto err_sched;
+	} else {
+		ret = sched_init_exec(drm);
+		if (ret)
+			goto err_sched;
+	}
 
 	return 0;
 
 /* error out in exact reverse order of init */
 err_sched:
+	cu_ctrl_fini(zdev);
+err_cu_ctrl:
 	zocl_fini_sysfs(drm->dev);
 err_sysfs:
 	zocl_xclbin_fini(zdev);
@@ -882,7 +971,8 @@ static int zocl_drm_platform_remove(struct platform_device *pdev)
 	if (zdev->fpga_mgr)
 		fpga_mgr_put(zdev->fpga_mgr);
 
-	sched_fini_exec(drm);
+	if (kds_mode == 0)
+		sched_fini_exec(drm);
 
 	zocl_clear_mem(zdev);
 	mutex_destroy(&zdev->mm_lock);
@@ -890,6 +980,11 @@ static int zocl_drm_platform_remove(struct platform_device *pdev)
 	zocl_xclbin_fini(zdev);
 	mutex_destroy(&zdev->zdev_xclbin_lock);
 	zocl_fini_sysfs(drm->dev);
+
+	if (kds_mode == 1) {
+		zocl_fini_sched(zdev);
+		cu_ctrl_fini(zdev);
+	}
 
 	kfree(zdev->apertures);
 
@@ -913,6 +1008,7 @@ static struct platform_driver zocl_drm_private_driver = {
 static struct platform_driver *const drivers[] = {
 	&zocl_ert_driver,
 	&zocl_ospi_versal_driver,
+	&cu_driver,
 };
 
 static int __init zocl_init(void)

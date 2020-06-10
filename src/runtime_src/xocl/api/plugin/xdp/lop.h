@@ -40,6 +40,9 @@ namespace xdplop {
 
   // The function that makes connections via dynamic linking and dynamic symbols
   void register_lop_functions(void* handle) ;
+
+  // A function that outputs any warnings based upon status and configuration
+  void lop_warning_function() ;
   
   // Every OpenCL API we are interested in will have an instance
   //  of this class constructed at the start
@@ -66,7 +69,7 @@ namespace xocl {
     inline void
     set_event_action(xocl::event* event, F&& f, Args&&... args)
     {
-      if (xrt_core::config::get_lop_profile())
+      if (xrt_core::config::get_lop_trace())
 	event->set_lop_action(f(std::forward<Args>(args)...));
     }
 
@@ -74,9 +77,9 @@ namespace xocl {
     std::function<void (xocl::event*, cl_int)> action_write() ;
     std::function<void (xocl::event*, cl_int)> action_migrate(cl_mem_migration_flags flags) ;
     std::function<void (xocl::event*, cl_int)> action_ndrange() ;
+    std::function<void (xocl::event*, cl_int)> action_ndrange_migrate(cl_kernel kernel) ;
     //std::function<void (xocl::event*)> action_map() ;
     //std::function<void (xocl::event*)> action_unmap() ;
-    //std::function<void (xocl::event*)> action_ndrange_migrate() ;
     //std::function<void (xocl::event*)> action_copy() ;
     
   } // end namespace lop

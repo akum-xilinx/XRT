@@ -25,6 +25,7 @@
 #include "xrt/device/device.h"
 #include "xrt/scheduler/command.h"
 #include "core/common/unistd.h"
+#include "core/common/scope_guard.h"
 
 #include <cassert>
 
@@ -53,26 +54,6 @@ public:
    *   The underlying xrt device managed by the platform
    */
   device(platform* pltf, xrt::device* xdevice);
-
-  /**
-   * Construct a schizophrenic device.
-   *
-   * This device doesn't really know what it wants to be. It could be a
-   * hw device, a swem device, or a hwem device, the actual decision
-   * is in some cases deferred until the program binary is loaded.
-   *
-   */
-  device(platform* pltf, xrt::device* hw_device, xrt::device* swem_device, xrt::device* hwem_device);
-
-  /**
-   * Construct a less schizophrenic device.
-   *
-   * This device is on a path to recovery and only suffers from dual
-   * personality disorder.  It could be a swem device or a hwem
-   * device, the actual decision is in some cases deferred until the
-   * program binary is loaded.
-   */
-  device(platform* pltf, xrt::device* swem_device, xrt::device* hwem_device);
 
   /**
    * Sub device constructor
@@ -108,16 +89,6 @@ public:
   {}
 
   virtual ~device();
-
-  /**
-   * Set platform, until passed in ctor.
-   * This is temp till we get rid of xcl_device_sim
-   */
-  void
-  set_platform(platform* platform)
-  {
-    m_platform = platform;
-  }
 
   unsigned int
   get_uid() const
@@ -216,18 +187,6 @@ public:
    */
   unsigned short
   get_max_clock_frequency() const;
-
-  /**
-   * Check if this device is an ARE device
-   *
-   * @return
-   *  True if ARE, false otherwise
-   */
-  bool
-  is_xare_device() const
-  {
-    return m_xdevice->is_xare_device();
-  }
 
 public:
   /**
@@ -378,27 +337,6 @@ public:
   get_cu_memidx() const;
 
   /**
-   * Get the indices of memory banks which CU argument is connected to
-   * for specified kernel.
-   *
-   * The function returns a bitset with bits for each bank connected
-   * to the specified argument of all device CUs for given kernel.
-   *
-   * If device has multiple CUs for given kernel and memory bank indeces
-   * have no overlap, then the function returns 0.
-   *
-   * @param kernel
-   *   Kernel used to identify CUs.  The device may contain CUs for
-   *   multiple kernels.
-   * @param argidx
-   *   The index of the kernel argument.
-   * @return
-   *   Bitset with matching mem bank indices or none() if no matches.
-   */
-  memidx_bitmask_type
-  get_cu_memidx(kernel* kernel, int argidx) const;
-
-  /**
    * Map buffer (clEnqueueMapBuffer) implementation
    */
   void*
@@ -520,6 +458,12 @@ public:
   free_stream_buf(xrt::device::stream_buf_handle handle);
 
   int
+  set_stream_opt(xrt::device::stream_handle stream, int type, uint32_t val);
+
+  int
+  poll_stream(xrt::device::stream_handle stream, xrt::device::stream_xfer_completions* comps, int min, int max, int* actual, int timeout);
+
+  int
   poll_streams(xrt::device::stream_xfer_completions* comps, int min, int max, int* actual, int timeout);
 
   /**
@@ -597,6 +541,25 @@ public:
   get_axlf() const;
 
   /**
+   * @return
+   *   axlf section, or nullptr if not present
+   */
+  XRT_XOCL_EXPORT
+  std::pair<const char*, size_t>
+  get_axlf_section(axlf_section_kind kind) const;
+
+  /**
+   * @return
+   *   axlf section, or nullptr if not present
+   */
+  template <typename SectionType>
+  SectionType
+  get_axlf_section(axlf_section_kind kind) const
+  {
+    return reinterpret_cast<SectionType>(get_axlf_section(kind).first);
+  }
+
+  /**
    * Check if this device is active, meaning it is programmed
    */
   bool
@@ -609,8 +572,8 @@ public:
    * lock count is incremented and returned.
    *
    * If the device is not currently locked, then this function
-   * queries hardware to check if the device is free and then
-   * locks it.
+   * queries hardware to check if the device is free in which
+   * case it is opened and locked.
    *
    * May throw cl error code if device could not be locked by probing
    * hardware.
@@ -629,7 +592,7 @@ public:
    *
    * If the device is currently locked, then this function
    * decrements the lock count.  If the lock count reaches 0,
-   * the hardware device is unlocked.
+   * the hardware device is unlocked (closed).
    *
    * May throw cl error code if device could not be unlocked by
    * probing hardware.
@@ -640,6 +603,20 @@ public:
    */
   unsigned int
   unlock();
+
+  /**
+   * Return a scoped lock guard managing a lock on the device.
+   *
+   * When the scope goes out of scope, the aquired lock is released
+   * automatically.
+   */
+  xrt_core::scope_guard<std::function<void()>>
+  lock_guard()
+  {
+    lock();
+    auto unlocker = [](device* d) { d->unlock(); };
+    return {std::bind(unlocker, this)};
+  }
 
   /**
    * Check is this device is available for use by this process.
@@ -742,20 +719,6 @@ private:
   clear_cus();
 
   /**
-   * Set xrt device when the final device is determined
-   *
-   * Throws if device is already set
-   */
-  void
-  set_xrt_device(xrt::device* xd,bool final=true);
-
-  /**
-   * Validate xclbin and set xrt device according to xclbin target
-   */
-  void
-  set_xrt_device(const xocl::xclbin& xclbin);
-
-  /**
    * Track mem object as allocated on this device
    */
   void
@@ -795,15 +758,11 @@ private:
 
   unsigned int m_uid = 0;
   program* m_active = nullptr;   // program loaded on to this device
-  xclbin m_xclbin;               // cache xclbin that came from program
+  xclbin m_metadata;             // cache xclbin that came from program
   unsigned int m_locks = 0;      // number of locks on this device
 
   platform* m_platform = nullptr;
   xrt::device* m_xdevice = nullptr;
-
-  xrt::device* m_hw_device = nullptr;
-  xrt::device* m_swem_device = nullptr;
-  xrt::device* m_hwem_device = nullptr;
 
   // Set for sub-device only
   ptr<device> m_parent = nullptr;

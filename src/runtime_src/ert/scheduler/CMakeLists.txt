@@ -1,5 +1,7 @@
 # Build ERT under legacy and u50 directories
 
+if (${ERT_BUILD_ALL} STREQUAL "yes")
+
 add_custom_command(
  OUTPUT legacy/bsp.extracted
  COMMAND ${CMAKE_COMMAND} -E make_directory legacy/bsp
@@ -92,6 +94,11 @@ install (FILES
  RENAME sched_v20.bin
  )
 
+endif(${ERT_BUILD_ALL} STREQUAL "yes")
+
+################################################################
+# HW emulation libsched_em
+################################################################
 file(GLOB SCH_SRC_FILES
   "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp"
   )
@@ -107,4 +114,4 @@ add_library(sched_em SHARED ${CURR_SOURCE}
 set_target_properties(sched_em PROPERTIES VERSION ${XRT_VERSION_STRING}
   SOVERSION ${XRT_SOVERSION})
 
-install (TARGETS sched_em LIBRARY DESTINATION ${XRT_INSTALL_DIR}/lib)
+install (TARGETS sched_em LIBRARY DESTINATION ${XRT_INSTALL_LIB_DIR})

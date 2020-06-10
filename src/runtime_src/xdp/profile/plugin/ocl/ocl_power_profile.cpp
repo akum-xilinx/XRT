@@ -1,3 +1,19 @@
+/**
+ * Copyright (C) 2019 Xilinx, Inc
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"). You may
+ * not use this file except in compliance with the License. A copy of the
+ * License is located at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ */
+
 # include "xdp/profile/plugin/ocl/ocl_power_profile.h"
 
 namespace xdp {
@@ -38,12 +54,45 @@ void OclPowerProfile::poll_power() {
         "xmc_vccint_curr",
         "xmc_vccint_vol",
         "xmc_3v3_pex_curr",
-        "xmc_3v3_pex_vol"
+        "xmc_3v3_pex_vol",
+        "xmc_cage_temp0",
+        "xmc_cage_temp1",
+        "xmc_cage_temp2",
+        "xmc_cage_temp3",
+        "xmc_dimm_temp0",
+        "xmc_dimm_temp1",
+        "xmc_dimm_temp2",
+        "xmc_dimm_temp3",
+        "xmc_fan_temp",
+        "xmc_fpga_temp",
+        "xmc_hbm_temp",
+        "xmc_se98_temp0",
+        "xmc_se98_temp1",
+        "xmc_se98_temp2",
+        "xmc_vccint_temp",
+        "xmc_fan_rpm"
     };
 
     std::vector<std::string> paths;
-    for(auto& e : entries) {
-        paths.push_back (target_device->getSysfsPath(subdev, e).get());
+    bool valid_paths_found = false;
+    for (auto& e : entries) {
+        try {
+            // If return value is null then there will be exception
+            std::string p = target_device->getSysfsPath(subdev, e).get();
+            // Check if at least one file exists
+            if (std::ifstream(p).good())
+                valid_paths_found = true;
+            paths.push_back(p);
+        } catch (...) {
+            valid_paths_found = false;
+            break;
+        }
+    }
+
+    if (!valid_paths_found) {
+        xrt::message::send(xrt::message::severity_level::XRT_WARNING,
+            "Power Profiling is unsupported on " + target_unique_name);
+        return;
     }
 
     while (should_continue()) {
@@ -82,17 +131,34 @@ void OclPowerProfile::stop_polling() {
 
 void OclPowerProfile::write_header() {
     power_profiling_output << "Target device: "
-                        << target_unique_name << std::endl;
+                           << target_unique_name 
+                           << std::endl;
     power_profiling_output << "timestamp,"
-                        << "12v_aux_curr" << ","
-                        << "12v_aux_vol"  << ","
-                        << "12v_pex_curr" << ","
-                        << "12v_pex_vol"  << ","
-                        << "vccint_curr"  << ","
-                        << "vccint_vol"   <<","
-                        << "3v3_pex_curr" << ","
-                        << "3v3_pex_vol"
-                        << std::endl;
+                           << "12v_aux_curr" << ","
+                           << "12v_aux_vol"  << ","
+                           << "12v_pex_curr" << ","
+                           << "12v_pex_vol"  << ","
+                           << "vccint_curr"  << ","
+                           << "vccint_vol"   << ","
+                           << "3v3_pex_curr" << ","
+                           << "3v3_pex_vol"  << ","
+                           << "cage_temp0"   << ","
+                           << "cage_temp1"   << ","
+                           << "cage_temp2"   << ","
+                           << "cage_temp3"   << ","
+                           << "dimm_temp0"   << ","
+                           << "dimm_temp1"   << ","
+                           << "dimm_temp2"   << ","
+                           << "dimm_temp3"   << ","
+                           << "fan_temp"     << ","
+                           << "fpga_temp"    << ","
+                           << "hbm_temp"     << ","
+                           << "se98_temp0"   << ","
+                           << "se98_temp1"   << ","
+                           << "se98_temp2"   << ","
+                           << "vccint_temp"  << ","
+                           << "fan_rpm"
+                           << std::endl;
 }
 
 void OclPowerProfile::write_trace() {

@@ -1,21 +1,16 @@
+/* SPDX-License-Identifier: GPL-2.0 OR Apache-2.0 */
 /*
  * A GEM style device manager for MPSoC based OpenCL accelerators.
  *
- * Copyright (C) 2017-2019 Xilinx, Inc. All rights reserved.
+ * Copyright (C) 2017-2020 Xilinx, Inc. All rights reserved.
  *
  * Authors:
  *    Soren Soe   <soren.soe@xilinx.com>
  *    Min Ma      <min.ma@xilinx.com>
  *    Jan Stephan <j.stephan@hzdr.de>
  *
- * This software is licensed under the terms of the GNU General Public
- * License version 2, as published by the Free Software Foundation, and
- * may be copied, distributed, and modified under those terms.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * This file is dual-licensed; you may select either the GNU General Public
+ * License version 2 or Apache License, Version 2.0.
  */
 #include <linux/bitmap.h>
 #include <linux/list.h>
@@ -532,7 +527,7 @@ static irqreturn_t sched_exec_isr(int irq, void *arg)
 	/* Check for done and write ap_continue to stop redundent interrupts */
 	if (zocl_cu_get_control(&zdev->exec->zcu[cu_idx]) == AP_CTRL_CHAIN)
 		zocl_cu_check(&zdev->exec->zcu[cu_idx]);
-	
+
 	/* This function returns the value of the interrupt status register
 	 * No need to check the interrupt type for now.
 	 */
@@ -577,6 +572,54 @@ init_cu_by_idx(struct sched_cmd *cmd, int cu_idx)
 }
 
 /**
+ * update_cus_rtp() - Update CUs Run Time Parameters from user space command.
+ *
+ * Use {offset, value} pairs to update CU arguments.
+ *
+ * Note: we only support asynchronously update 32 bits scaler.
+ */
+static void
+update_cus_rtp(struct sched_cmd *cmd)
+{
+	struct drm_zocl_dev *zdev = cmd->ddev->dev_private;
+	struct ert_init_kernel_cmd *ik;
+	uint32_t *cmp;
+	int num_masks = cu_masks(cmd);
+	int mask_idx;
+	u32 size = regmap_size(cmd);
+
+	ik = (struct ert_init_kernel_cmd *)cmd->packet;
+	cmp = &ik->cu_mask;
+
+	for (mask_idx = 0; mask_idx < num_masks; ++mask_idx) {
+		u32 cmd_mask = cmp[mask_idx];
+		int cu_idx;
+
+		while ((cu_idx = ffs(cmd_mask))) {
+			struct zocl_cu *cu;
+
+			/* ffs is "1" based */
+			cu_idx = ffs(cmd_mask) - 1;
+
+			/* Clear the mask bit we checked */
+			cmd_mask &= ~(1 << cu_idx);
+
+			cu_idx = cu_idx_from_mask(cu_idx, mask_idx);
+
+			if (!zocl_cu_is_valid(zdev->exec, cu_idx)) {
+				DRM_WARN("Update invalid CU %d, Skipped.\n",
+				    cu_idx);
+				continue;
+			}
+
+			cu = &cmd->exec->zcu[cu_idx];
+			zocl_cu_configure(cu, ik->data + ik->extra_cu_masks,
+			    size, PAIRS);
+		}
+	}
+}
+
+/**
  * init_cus() - Initialize CUs from user space command.
  *
  * Process the initialize CUs command sent from user space. Only one process
@@ -599,6 +642,9 @@ init_cus(struct sched_cmd *cmd)
 	int warn_flag = 0;
 
 	ik = (struct ert_init_kernel_cmd *)cmd->packet;
+	if (ik->update_rtp)
+		return update_cus_rtp(cmd);
+
 	cmp = &ik->cu_mask;
 
 	run_timeout = ik->cu_run_timeout;
@@ -730,12 +776,7 @@ configure(struct sched_cmd *cmd)
 	}
 
 	SCHED_DEBUG("Configuring scheduler\n");
-	exec->num_slots       = CQ_SIZE / cfg->slot_size;
 	write_lock(&zdev->attr_rwlock);
-	exec->num_cus         = cfg->num_cus;
-	exec->cu_shift_offset = cfg->cu_shift;
-	exec->cu_base_addr    = cfg->cu_base_addr;
-	exec->num_cu_masks    = ((exec->num_cus - 1)>>5) + 1;
 
 	if (!zdev->ert) {
 		if (cfg->ert)
@@ -755,6 +796,7 @@ configure(struct sched_cmd *cmd)
 		exec->configured = 1;
 	} else {
 		SCHED_DEBUG("++ configuring PS ERT mode\n");
+
 		exec->ops = &ps_ert_ops;
 		exec->polling_mode = cfg->polling;
 		exec->cq_interrupt = cfg->cq_int;
@@ -768,6 +810,18 @@ configure(struct sched_cmd *cmd)
 		zdev->ert->ops->config(zdev->ert, cfg);
 		exec->configured = 1;
 	}
+
+	/*
+	 * Note: for current design: the slot_size can be not 4k,
+	 * but cq_size is always 64k.
+	 */
+	exec->num_slots       = CQ_SIZE / cfg->slot_size;
+	exec->num_cus         = cfg->num_cus;
+	exec->cu_shift_offset = cfg->cu_shift;
+	exec->cu_base_addr    = cfg->cu_base_addr;
+	exec->num_cu_masks    = exec->num_cus == 0 ? 0 :
+	    ((exec->num_cus - 1)>>5) + 1;
+
 	write_unlock(&zdev->attr_rwlock);
 
 	/* Enable interrupt from host to PS when new commands are ready */
@@ -789,6 +843,9 @@ configure(struct sched_cmd *cmd)
 	/* TODO: let's consider how to support reconfigurable KDS/ERT later.
 	 * At that time, ERT should be able to change back to CQ polling mode.
 	 */
+
+	if (exec->num_cus == 0)
+		goto print_and_out;
 
 	exec->zcu = vzalloc(sizeof(struct zocl_cu) * exec->num_cus);
 	if (!exec->zcu) {
@@ -894,10 +951,10 @@ configure(struct sched_cmd *cmd)
 		if (!zocl_cu_is_valid(exec, i))
 			continue;
 
-		exec->zcu[j].irq_name = kzalloc(20, GFP_KERNEL);
-		sprintf(exec->zcu[j].irq_name, "zocl_cu[%d]", i);
+		exec->zcu[i].irq_name = kzalloc(20, GFP_KERNEL);
+		sprintf(exec->zcu[i].irq_name, "zocl_cu[%d]", i);
 		ret = request_irq(exec->zcu[i].irq, sched_exec_isr, 0,
-				  exec->zcu[j].irq_name, zdev);
+				  exec->zcu[i].irq_name, zdev);
 		if (ret) {
 			/* Fail to install at least one interrupt
 			 * handler. We need to free the handler(s)
@@ -999,6 +1056,22 @@ cu_stat(struct sched_cmd *cmd)
 	SCHED_DEBUG("<- %s\n", __func__);
 }
 
+static void
+zocl_cu_reclaim(struct drm_zocl_dev *zdev)
+{
+	struct sched_exec_core *exec = zdev->exec;
+	int i;
+
+	for (i = 0; i < exec->num_cus; i++) {
+		if (zocl_cu_is_valid(exec, i)) {
+			zocl_cu_set_invalid(exec, i);
+			zocl_cu_fini(&exec->zcu[i]);
+		}
+	}
+
+	vfree(zdev->exec->zcu);
+}
+
 static int
 configure_soft_kernel(struct sched_cmd *cmd)
 {
@@ -1012,22 +1085,6 @@ configure_soft_kernel(struct sched_cmd *cmd)
 	SCHED_DEBUG("-> %s", __func__);
 
 	cfg = (struct ert_configure_sk_cmd *)(cmd->packet);
-
-	if (cfg->sk_type == SOFTKERNEL_TYPE_XCLBIN) {
-		void *xclbin_buffer = NULL;
-
-		/* remap device physical addr to kernel virtual addr */
-		xclbin_buffer =
-		    memremap(cfg->sk_addr, cfg->sk_size, MEMREMAP_WC);
-		if (xclbin_buffer == NULL) {
-			ret = -ENOMEM;
-			goto fail;
-		}
-		ret = zocl_xclbin_load_pdi(zdev, xclbin_buffer);
-		memunmap(xclbin_buffer);
-		return ret;
-	}
-
 
 	mutex_lock(&sk->sk_lock);
 
@@ -1690,8 +1747,10 @@ zocl_print_stale_cmd(struct sched_cmd *cmd)
 {
 	DRM_INFO("stale cmd state[%d], cu[%d], slot[%d], cq_slot[%d]",
 	    cmd->state, cmd->cu_idx, cmd->slot_idx, cmd->cq_slot_idx);
-	DRM_INFO("          check_timeout=%d, client pid %d.",
-	    cmd->check_timeout, pid_nr(cmd->client->pid));
+	if (!is_ert(cmd->ddev)) {
+		DRM_INFO("          check_timeout=%d, client pid %d.",
+			 cmd->check_timeout, pid_nr(cmd->client->pid));
+	}
 }
 
 /**
@@ -1877,12 +1936,17 @@ ert_configure_cu(struct sched_cmd *cmd, int cu_idx)
 	u32 size = regmap_size(cmd);
 	struct ert_start_kernel_cmd *sk;
 	struct zocl_cu *cu = &cmd->exec->zcu[cu_idx];
-	int type = CONSECUTIVE;
+	int type;
 
 	SCHED_DEBUG("-> %s cu_idx=%d, regmap_size=%d\n",
 	    __func__, cu_idx, size);
 
 	sk = (struct ert_start_kernel_cmd *)cmd->packet;
+
+	if (opcode(cmd) == ERT_EXEC_WRITE)
+		type = PAIRS;
+	else
+		type = CONSECUTIVE;
 
 	zocl_cu_configure(cu, sk->data + sk->extra_cu_masks, size, type);
 
@@ -2575,7 +2639,11 @@ ps_ert_query(struct sched_cmd *cmd)
 	case ERT_EXEC_WRITE:
 		if (!cu_done(cmd))
 			break;
+#if KERNEL_VERSION(5, 4, 0) > LINUX_VERSION_CODE
 		__attribute__ ((fallthrough));
+#else
+		__attribute__ ((__fallthrough__));
+#endif
 		/* pass through */
 
 	case ERT_CU_STAT:
@@ -2735,7 +2803,7 @@ zocl_execbuf_to_ert(struct drm_zocl_bo *bo, struct drm_file *filp)
  * @dev: Device node calling execbuf
  * @bo: buffer objects from user space from which new command is created
  *
-*/
+ */
 static bool
 zocl_dma_check(struct drm_device *dev, struct drm_zocl_bo *bo)
 {
@@ -2758,7 +2826,7 @@ zocl_dma_check(struct drm_device *dev, struct drm_zocl_bo *bo)
 }
 
 /**
- * zocl_execbuf_ioctl() - Entry point for exec buffer.
+ * zocl_execbuf_exec() - Entry point for exec buffer.
  *
  * @dev: Device node calling execbuf
  * @data: Payload
@@ -2769,7 +2837,7 @@ zocl_dma_check(struct drm_device *dev, struct drm_zocl_bo *bo)
  * Return: 0 on success, -errno otherwise
  */
 int
-zocl_execbuf_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+zocl_execbuf_exec(struct drm_device *dev, void *data, struct drm_file *filp)
 {
 	struct drm_gem_object *gem_obj;
 	struct drm_zocl_bo *zocl_bo;
@@ -2950,7 +3018,9 @@ create_cmd_buffer(struct ert_packet *packet, unsigned int slot_size)
  *
  * @drm:  DRM device
  *
- * Return: errno
+ * Return: 0: One iteration done
+ *	   1: Exit command...
+ *	   -errno: error number
  */
 static int
 iterate_packets(struct drm_device *drm)
@@ -2966,6 +3036,14 @@ iterate_packets(struct drm_device *drm)
 	packet = ert->cq_ioremap;
 	num_slots = exec_core->num_slots;
 	slot_sz = slot_size(zdev->ddev);
+
+	/* The first slot is ctrl slot in CQ.
+	 * It might has special command.
+	 */
+	if (packet->opcode == ERT_EXIT) {
+		packet->state = ERT_CMD_STATE_COMPLETED;
+		return 1;
+	}
 
 	for (slot_idx = 0; slot_idx < num_slots; slot_idx++) {
 		buffer = create_cmd_buffer(packet, slot_sz);
@@ -3002,7 +3080,11 @@ cq_check(void *data)
 
 	SCHED_DEBUG("-> %s", __func__);
 	while (!kthread_should_stop() && !exec_core->cq_interrupt) {
-		iterate_packets(zdev->ddev);
+		if (iterate_packets(zdev->ddev) == 1) {
+			/* This thread should exit */
+			exec_core->cq_thread = NULL;
+			break;
+		}
 		schedule();
 	}
 	SCHED_DEBUG("<- %s", __func__);
@@ -3022,6 +3104,16 @@ static irqreturn_t sched_cq_isr(int irq, void *arg)
 	good_pkg = 1;
 	slot_sz = slot_size(zdev->ddev);
 	pkg = zdev->ert->ops->get_next_cmd(zdev->ert, NULL, &slot_idx);
+	/* The first slot is ctrl slot in CQ.
+	 * It might has special command.
+	 */
+	if (slot_idx == 0 && pkg->opcode == ERT_EXIT) {
+		/* Exit command, do not response to CQ interrupt anymore */
+		disable_irq_nosync(irq);
+		pkg->state = ERT_CMD_STATE_COMPLETED;
+		goto out;
+	}
+
 	while (pkg) {
 		/* Usually, if the status of the pkg is not NEW. We think it is
 		 * not 'good' at this point.
@@ -3039,6 +3131,7 @@ static irqreturn_t sched_cq_isr(int irq, void *arg)
 		good_pkg = 1;
 	}
 
+out:
 	SCHED_DEBUG("<- %s", __func__);
 	return IRQ_HANDLED;
 }
@@ -3048,7 +3141,7 @@ static inline void init_exec(struct sched_exec_core *exec_core)
 	unsigned int i;
 
 	exec_core->scheduler = &g_sched0;
-	exec_core->num_slots = 16;
+	exec_core->num_slots = CQ_SLOT_NUM;
 	exec_core->num_cus = 0;
 	exec_core->cu_base_addr = 0;
 	exec_core->cu_shift_offset = 0;
@@ -3143,6 +3236,8 @@ fini_configure(struct drm_device *drm)
 
 	if (zdev->exec->cq_interrupt)
 		free_irq(zdev->ert->irq[ERT_CQ_IRQ], zdev);
+
+	zocl_cu_reclaim(zdev);
 }
 
 /**
@@ -3164,9 +3259,33 @@ int sched_fini_exec(struct drm_device *drm)
 		kthread_stop(zdev->exec->cq_thread);
 
 	fini_scheduler_thread();
-	vfree(zdev->exec->zcu);
 	zocl_cleanup_cu_timer(zdev);
 	SCHED_DEBUG("<- %s\n", __func__);
+
+	return 0;
+}
+
+/*
+ * A simplified version of reset scheduler. This is to support DFX on
+ * Hybrid-platform which is running in ert mode. All the context and
+ * command draining are managed by host side XRT.
+ */
+int
+sched_reset_scheduler(struct drm_device *drm)
+{
+	struct drm_zocl_dev *zdev = drm->dev_private;
+	struct sched_exec_core *exec = zdev->exec;
+
+	DRM_INFO("%s: stop scheduler", __func__);
+
+	/* Once stopped, keep this status until reset done */
+	atomic_set(&exec->exec_status, ZOCL_EXEC_STOP);
+
+	fini_configure(drm);
+	init_exec(exec);
+
+	/* start receiving cmds */
+	atomic_set(&exec->exec_status, ZOCL_EXEC_NORMAL);
 
 	return 0;
 }

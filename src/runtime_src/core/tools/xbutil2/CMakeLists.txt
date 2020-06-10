@@ -20,28 +20,21 @@ file(GLOB XBUTIL_V2_BASE_FILES
   "../common/SubCmd.cpp"
   "../common/OptionOptions.cpp"
   "../common/XBHelpMenus.cpp"
+  "../common/Report*.cpp"
 )
 
 # Collect local directory files
 file(GLOB XBUTIL_V2_SUBCMD_FILES
   "XBReport.cpp"
   "XBDatabase.cpp"
-  "SubCmdClock.cpp"
-  "SubCmdDD.cpp"
   "SubCmdDmaTest.cpp"
   "SubCmdDump.cpp"
   "SubCmdExamine.cpp"
-  "SubCmdList.cpp"
-  "SubCmdM2MTest.cpp"
-  "SubCmdMem.cpp"
-  "SubCmdP2P.cpp"
   "SubCmdProgram.cpp"
   "SubCmdQuery.cpp"
   "SubCmdReset.cpp"
   "SubCmdScan.cpp"
-  "SubCmdTop.cpp"
   "SubCmdValidate.cpp"
-  "SubCmdVersion.cpp"
   "SubCmdAdvanced.cpp"
   "OO_Clock.cpp"
   "OO_MemRead.cpp"
@@ -56,8 +49,10 @@ set(XBUTIL_V2_SRCS ${XBUTIL_V2_FILES_SRCS})
 # Determine the name of the executable
 if(WIN32)
   set(XBUTIL2_NAME "xbutil")     # Yes, on windows the file name will be xbutil
+  set(XRT_LOADER_SCRIPTS "xbutil" "xbutil.bat")
 else()
   set(XBUTIL2_NAME "xbutil2")
+  set(XRT_LOADER_SCRIPTS "xbutil")
 endif()
 
 add_executable(${XBUTIL2_NAME} ${XBUTIL_V2_SRCS})
@@ -74,12 +69,11 @@ endif()
 if(WIN32)
   target_link_libraries(
     ${XBUTIL2_NAME} PRIVATE
-    Boost::filesystem
-    Boost::program_options
-    Boost::system
+    ${Boost_FILESYSTEM_LIBRARY}
+    ${Boost_SYSTEM_LIBRARY}
+    ${Boost_PROGRAM_OPTIONS_LIBRARY}
     xrt_core
-    xrt_core_static
-    xrt_coreutil_static
+    xrt_coreutil
   )
 
 else()
@@ -88,9 +82,9 @@ else()
     xrt_core
     xrt_core_static
     xrt_coreutil_static
-    boost_filesystem
-    boost_system
-    boost_program_options
+    ${Boost_FILESYSTEM_LIBRARY}
+    ${Boost_SYSTEM_LIBRARY}
+    ${Boost_PROGRAM_OPTIONS_LIBRARY}
     pthread
     uuid
     dl
@@ -98,6 +92,7 @@ else()
 endif()
 
 # Install our built executable
-install (TARGETS ${XBUTIL2_NAME} RUNTIME DESTINATION ${XRT_INSTALL_DIR}/bin)
+install (TARGETS ${XBUTIL2_NAME} RUNTIME DESTINATION ${XRT_INSTALL_UNWRAPPED_DIR})
+install (PROGRAMS ${XRT_LOADER_SCRIPTS} DESTINATION ${XRT_INSTALL_BIN_DIR})
 
 # -----------------------------------------------------------------------------

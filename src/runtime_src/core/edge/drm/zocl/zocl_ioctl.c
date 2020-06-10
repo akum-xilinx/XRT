@@ -1,26 +1,27 @@
+/* SPDX-License-Identifier: GPL-2.0 OR Apache-2.0 */
 /*
  * A GEM style (optionally CMA backed) device manager for ZynQ based
  * OpenCL accelerators.
  *
- * Copyright (C) 2016-2019 Xilinx, Inc. All rights reserved.
+ * Copyright (C) 2016-2020 Xilinx, Inc. All rights reserved.
  *
  * Authors:
  *    Sonal Santan <sonal.santan@xilinx.com>
  *    Jan Stephan  <j.stephan@hzdr.de>
  *
- * This software is licensed under the terms of the GNU General Public
- * License version 2, as published by the Free Software Foundation, and
- * may be copied, distributed, and modified under those terms.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * This file is dual-licensed; you may select either the GNU General Public
+ * License version 2 or Apache License, Version 2.0.
  */
 
 #include "sched_exec.h"
 #include "zocl_xclbin.h"
 #include "zocl_generic_cu.h"
+
+extern int kds_mode;
+
+/* TODO: remove this once new KDS is ready */
+int zocl_xclbin_ctx(struct drm_zocl_dev *zdev, struct drm_zocl_ctx *ctx,
+		    struct sched_client_ctx *client);
 
 /*
  * read_axlf and ctx should be protected by zdev_xclbin_lock exclusively.
@@ -60,6 +61,10 @@ zocl_ctx_ioctl(struct drm_device *ddev, void *data, struct drm_file *filp)
 	struct drm_zocl_dev *zdev = ZOCL_GET_ZDEV(ddev);
 	int ret = 0;
 
+	if (kds_mode == 1) {
+		return zocl_context_ioctl(zdev, data, filp);
+	}
+
 	if (args->op == ZOCL_CTX_OP_OPEN_GCU_FD) {
 		ret = zocl_open_gcu(zdev, args, filp->driver_priv);
 		return ret;
@@ -86,7 +91,7 @@ zocl_info_cu_ioctl(struct drm_device *ddev, void *data, struct drm_file *filp)
 	int cu_idx = args->cu_idx;
 	phys_addr_t addr = args->paddr;
 
-	if (!exec->configured) {
+	if (kds_mode == 0 && !exec->configured) {
 		DRM_ERROR("Schduler is not configured\n");
 		return -EINVAL;
 	}
@@ -107,5 +112,18 @@ out:
 	args->paddr = addr;
 	args->apt_idx = apt_idx;
 	args->cu_idx = cu_idx;
+	return 0;
+}
+
+int
+zocl_execbuf_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+{
+	struct drm_zocl_dev *zdev = dev->dev_private;
+
+	if (kds_mode == 1)
+		zocl_command_ioctl(zdev, data, filp);
+	else
+		zocl_execbuf_exec(dev, data, filp);
+
 	return 0;
 }

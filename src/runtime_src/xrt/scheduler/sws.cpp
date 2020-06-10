@@ -22,10 +22,12 @@
  */
 #include "scheduler.h"
 #include "xrt/util/debug.h"
-#include "xrt/util/thread.h"
 #include "xrt/util/task.h"
 #include "ert.h"
 #include "xclbin.h"
+#include "core/common/system.h"
+#include "core/common/device.h"
+#include "core/common/thread.h"
 #include "core/common/xclbin_parser.h"
 #include "command.h"
 #include <limits>
@@ -856,10 +858,10 @@ start()
 {
   if (s_running)
     throw std::runtime_error("software command scheduler is already started");
-
-  s_scheduler_thread = std::move(xrt::thread(scheduler_loop));
+  XRT_DEBUG(std::cout, "SWS Thread started\n");
+  s_scheduler_thread = std::move(xrt_core::thread(scheduler_loop));
   if (threaded_notification)
-    notifier = std::move(xrt::thread(xrt::task::worker,std::ref(notify_queue)));
+    notifier = std::move(xrt_core::thread(xrt::task::worker,std::ref(notify_queue)));
   s_running = true;
 }
 
@@ -886,28 +888,33 @@ stop()
 }
 
 void
-init(xrt::device* xdev, const std::vector<uint64_t>& cu_addr_map)
+init(xrt::device* xdev)
 {
-  if (!is_sw_emulation())
-    throw std::runtime_error("unexpected scheduler initialization call in non sw emulation");
+  auto cdev = xrt_core::get_userpf_device(xdev->get_handle());
 
-  std::vector<addr_type> amap(cu_addr_map.begin(),cu_addr_map.end());
-  auto slots = ERT_CQ_SIZE / xrt::config::get_ert_slotsize();
-  cu_trace_enabled = xrt::config::get_profile();
-  s_device_exec_core.erase(xdev);
-  s_device_exec_core.insert
-    (std::make_pair
-     (xdev,std::make_unique<exec_core>(xdev,&s_global_scheduler,slots,amap)));
-}
+  auto ip_section = cdev->get_axlf_section(IP_LAYOUT);
+  auto ip_layout = reinterpret_cast<const ::ip_layout*>(ip_section.first);
+  if (!is_sw_emulation() && !ip_layout)
+    throw std::runtime_error("No ip layout available to initialize sws, make sure xclbin is loaded");
 
-void
-init(xrt::device* xdev, const axlf* top)
-{
-  // create execution core for this device
-  auto slots = ERT_CQ_SIZE / xrt::config::get_ert_slotsize();
-  cu_trace_enabled = xrt::config::get_profile();
-  auto cuaddrs = xrt_core::xclbin::get_cus(top);
+  // XML meta data needed to get ert slot size
+  auto xml_section = cdev->get_axlf_section(EMBEDDED_METADATA);
+  auto xml_data = xml_section.first;
+  auto xml_size = xml_section.second;
+  if (!xml_data)
+    throw std::runtime_error("No xml metadata available to initialize sws, make sure xclbin is loaded");
+
+  // CU base addresses from IP_LAYOUT except in SW EMU where xml is parsed
+  auto cuaddrs = is_sw_emulation()
+    ? xrt_core::xclbin::get_cus(xml_data, xml_size)
+    : xrt_core::xclbin::get_cus(ip_layout);
   std::vector<addr_type> amap(cuaddrs.begin(),cuaddrs.end());
+
+  // Slots are computed by device, its a function of device properties
+  auto slots = cdev->get_ert_slots(xml_data, xml_size).first;
+
+  cu_trace_enabled = xrt::config::get_profile();
+
   s_device_exec_core.erase(xdev);
   s_device_exec_core.insert
     (std::make_pair

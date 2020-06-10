@@ -18,10 +18,13 @@
 // Local - Include Files
 #include "XBHelpMenus.h"
 #include "XBUtilities.h"
+#include "core/common/time.h"
+
 namespace XBU = XBUtilities;
 
 
 // 3rd Party Library - Include Files
+#include <boost/property_tree/json_parser.hpp>
 #include <boost/format.hpp>
 namespace po = boost::program_options;
 
@@ -82,6 +85,7 @@ static const uint8_t FGC_EXTENDED_BODY    = 70;  // 70
 
 // ------ S T A T I C   V A R I A B L E S -------------------------------------
 static unsigned int m_maxColumnWidth = 90;
+static unsigned int m_shortDescriptionColumn = 24;
 
 
 // ------ F U N C T I O N S ---------------------------------------------------
@@ -216,6 +220,7 @@ void
 XBUtilities::report_commands_help( const std::string &_executable, 
                                    const std::string &_description,
                                    const boost::program_options::options_description& _optionDescription,
+                                   const boost::program_options::options_description& _optionHidden,
                                    const SubCmdsCollection &_subCmds)
 { 
   // Formatting color parameters
@@ -229,6 +234,7 @@ XBUtilities::report_commands_help( const std::string &_executable,
 
   // Helper variable
   std::string formattedString;
+  static std::string sHidden = "(Hidden)";
 
   // -- Command description
   XBU::wrap_paragraphs(_description, 13, m_maxColumnWidth, false, formattedString);
@@ -250,7 +256,7 @@ XBUtilities::report_commands_help( const std::string &_executable,
 
   for (auto& subCmdEntry : _subCmds) {
     // Filter out hidden subcommand
-    if (subCmdEntry->isHidden()) 
+    if (!XBU::getShowHidden() && subCmdEntry->isHidden()) 
       continue;
 
     // Depricated sub-command
@@ -280,10 +286,12 @@ XBUtilities::report_commands_help( const std::string &_executable,
   boost::format fmtSubCmdHdr(fgc_header + "\n%s COMMANDS:\n" + fgc_reset);  
   boost::format fmtSubCmd(fgc_subCmd + "  %-10s " + fgc_subCmdBody + "- %s\n" + fgc_reset); 
   unsigned int subCmdDescTab = 15;
+
   if (!subCmdsReleased.empty()) {
     std::cout << fmtSubCmdHdr % "AVAILABLE";
     for (auto & subCmdEntry : subCmdsReleased) {
-      XBU::wrap_paragraphs(subCmdEntry->getShortDescription(), subCmdDescTab, m_maxColumnWidth, false, formattedString);
+      std::string sPreAppend = subCmdEntry->isHidden() ? sHidden + " " : "";
+      XBU::wrap_paragraphs(sPreAppend + subCmdEntry->getShortDescription(), subCmdDescTab, m_maxColumnWidth, false, formattedString);
       std::cout << fmtSubCmd % subCmdEntry->getName() % formattedString;
     }
   }
@@ -291,7 +299,8 @@ XBUtilities::report_commands_help( const std::string &_executable,
   if (!subCmdsPreliminary.empty()) {
     std::cout << fmtSubCmdHdr % "PRELIMINARY";
     for (auto & subCmdEntry : subCmdsPreliminary) {
-      XBU::wrap_paragraphs(subCmdEntry->getShortDescription(), subCmdDescTab, m_maxColumnWidth, false, formattedString);
+      std::string sPreAppend = subCmdEntry->isHidden() ? sHidden + " " : "";
+      XBU::wrap_paragraphs(sPreAppend + subCmdEntry->getShortDescription(), subCmdDescTab, m_maxColumnWidth, false, formattedString);
       std::cout << fmtSubCmd % subCmdEntry->getName() % formattedString;
     }
   }
@@ -299,12 +308,16 @@ XBUtilities::report_commands_help( const std::string &_executable,
   if (!subCmdsDepricated.empty()) {
     std::cout << fmtSubCmdHdr % "DEPRECATED";
     for (auto & subCmdEntry : subCmdsDepricated) {
-      XBU::wrap_paragraphs(subCmdEntry->getShortDescription(), subCmdDescTab, m_maxColumnWidth, false, formattedString);
+      std::string sPreAppend = subCmdEntry->isHidden() ? sHidden + " " : "";
+      XBU::wrap_paragraphs(sPreAppend + subCmdEntry->getShortDescription(), subCmdDescTab, m_maxColumnWidth, false, formattedString);
       std::cout << fmtSubCmd % subCmdEntry->getName() % formattedString;
     }
   }
 
   report_option_help("OPTIONS", _optionDescription, emptyPOD);
+
+  if (XBU::getShowHidden()) 
+    report_option_help(std::string("OPTIONS ") + sHidden, _optionHidden, emptyPOD);
 }
 
 static std::string 
@@ -380,6 +393,7 @@ XBUtilities::report_subcommand_help( const std::string &_executableName,
                                      const std::string &_description, 
                                      const std::string &_extendedHelp,
                                      const boost::program_options::options_description &_optionDescription,
+                                     const boost::program_options::options_description &_optionHidden,
                                      const boost::program_options::positional_options_description & _positionalDescription)
 {
   // Formatting color parameters
@@ -426,6 +440,9 @@ XBUtilities::report_subcommand_help( const std::string &_executableName,
   // -- Options
   report_option_help("OPTIONS", _optionDescription, _positionalDescription, false);
 
+  if (XBU::getShowHidden()) 
+    report_option_help("OPTIONS (Hidden)", _optionHidden, _positionalDescription, false);
+
   // Extended help
   boost::format fmtExtHelp(fgc_extendedBody + "\n  %s\n" +fgc_reset);
   XBU::wrap_paragraph(_extendedHelp, 2, m_maxColumnWidth, false, formattedString);
@@ -439,6 +456,7 @@ XBUtilities::report_subcommand_help( const std::string &_executableName,
                                      const std::string &_description, 
                                      const std::string &_extendedHelp,
                                      const boost::program_options::options_description &_optionDescription,
+                                     const boost::program_options::options_description &_optionHidden,
                                      const SubCmd::SubOptionOptions & _subOptionOptions)
 {
   // Formatting color parameters
@@ -470,9 +488,16 @@ XBUtilities::report_subcommand_help( const std::string &_executableName,
     std::cout << fmtHeader % formattedString;
 
   // -- Usage
-  auto pipeFold = [](std::string a, auto &b) { return std::move(a)+ " | " + b->longName(); };
-  std::string usageSubCmds = std::accumulate( std::next(_subOptionOptions.begin()), _subOptionOptions.end(),
-                                              _subOptionOptions[0]->longName(), pipeFold);
+  std::string usageSubCmds;
+  for (const auto & subCmd : _subOptionOptions) {
+    if (subCmd->isHidden()) 
+      continue;
+
+    if (!usageSubCmds.empty()) 
+      usageSubCmds.append(" | ");
+
+    usageSubCmds.append(subCmd->longName());
+  }
 
   std::cout << boost::format(fgc_header + "\nUSAGE: " + fgc_usageBody + "%s %s [-h] --[ %s ] [commandArgs]\n" + fgc_reset) % _executableName % _subCommand % usageSubCmds;
 
@@ -480,10 +505,203 @@ XBUtilities::report_subcommand_help( const std::string &_executableName,
   boost::program_options::positional_options_description emptyPOD;
   report_option_help("OPTIONS", _optionDescription, emptyPOD, false);
 
+  if (XBU::getShowHidden()) 
+    report_option_help("OPTIONS (Hidden)", _optionHidden, emptyPOD, false);
+
   // Extended help
   boost::format fmtExtHelp(fgc_extendedBody + "\n  %s\n" +fgc_reset);
   XBU::wrap_paragraph(_extendedHelp, 2, m_maxColumnWidth, false, formattedString);
   if (!formattedString.empty()) 
     std::cout << fmtExtHelp % formattedString;
+}
+
+std::string 
+XBUtilities::create_suboption_list_string(const VectorPairStrings &_collection)
+{
+  // Working variables
+  const unsigned int maxColumnWidth = m_maxColumnWidth - m_shortDescriptionColumn; 
+  std::string supportedValues;        // Formatted string of supported values
+  std::string formattedString;        // Helper working string
+                                      
+  // Determine the indention width
+  unsigned int maxStringLength = 0;
+  for (const auto & pairs : _collection)
+    maxStringLength = std::max(maxStringLength, (unsigned int) pairs.first.length());
+
+  const unsigned int indention = maxStringLength + 5;  // New line indention after the '-' character (5 extra spaces)
+  boost::format reportFmt(std::string("  %-") + std::to_string(maxStringLength) + "s - %s\n");  
+
+  // report names and discription
+  for (const auto & pairs : _collection) {
+    XBU::wrap_paragraphs(boost::str(reportFmt % pairs.first % pairs.second), indention, maxColumnWidth, false /*indent first line*/, formattedString);
+    supportedValues += formattedString;
+  }
+
+  return supportedValues;
+}
+
+
+
+std::string 
+XBUtilities::create_suboption_list_string( const ReportCollection &_reportCollection, 
+                                           bool _addVerboseOption)
+{
+  VectorPairStrings reportDescriptionCollection;
+
+  // 'verbose' option
+  if (_addVerboseOption) 
+    reportDescriptionCollection.emplace_back("verbose", "All known reports are produced");
+
+  // report names and discription
+  for (const auto & report : _reportCollection) {
+    reportDescriptionCollection.emplace_back(report->getReportName(), report->getShortDescription());
+  }
+
+  return create_suboption_list_string(reportDescriptionCollection);
+}
+
+std::string 
+XBUtilities::create_suboption_list_string( const Report::SchemaDescriptionVector &_formatCollection)
+{
+  VectorPairStrings reportDescriptionCollection;
+
+  // report names and discription
+  for (const auto & format : _formatCollection) {
+    if (format.isVisable == true) 
+      reportDescriptionCollection.emplace_back(format.optionName, format.shortDescription);
+  }
+
+  return create_suboption_list_string(reportDescriptionCollection);
+}
+
+
+void 
+XBUtilities::collect_and_validate_reports( const ReportCollection &allReportsAvailable,
+                                           const std::vector<std::string> &reportNamesToAdd,
+                                           ReportCollection & reportsToUse)
+{
+  // If "verbose" used, then use all of the reports
+  if (std::find(reportNamesToAdd.begin(), reportNamesToAdd.end(), "verbose") != reportNamesToAdd.end()) {
+    reportsToUse = allReportsAvailable;
+  } else { 
+    // Examine each report name for a match 
+    for (const auto & reportName : reportNamesToAdd) {
+      auto iter = std::find_if(allReportsAvailable.begin(), allReportsAvailable.end(), 
+                               [&reportName](const std::shared_ptr<Report>& obj) {return obj->getReportName() == reportName;});
+      if (iter != allReportsAvailable.end()) 
+        reportsToUse.push_back(*iter);
+      else {
+        throw xrt_core::error((boost::format("No report generator found for report: '%s'\n") % reportName).str());
+      }
+    }
+  }
+}
+
+
+void 
+XBUtilities::produce_reports( xrt_core::device_collection _devices, 
+                              const ReportCollection & _reportsToProcess, 
+                              Report::SchemaVersion _schemaVersion, 
+                              std::vector<std::string> & _elementFilter,
+                              std::ostream &_ostream)
+{
+  // Some simple DRCs
+  if (_reportsToProcess.empty()) {
+    _ostream << "Info: No action taken, no reports given.\n";
+    return;
+  }
+
+  if (_schemaVersion == Report::SchemaVersion::unknown) {
+    _ostream << "Info: No action taken, 'UNKNOWN' schema value specified.\n";
+    return;
+  }
+
+  // Working property tree
+  boost::property_tree::ptree ptRoot;
+
+  // Add schema version
+  {
+    boost::property_tree::ptree ptSchemaVersion;
+    ptSchemaVersion.put("schema", Report::getSchemaDescription(_schemaVersion).optionName.c_str());
+    ptSchemaVersion.put("creation_date", xrt_core::timestamp());
+
+    ptRoot.add_child("schema_version", ptSchemaVersion);
+  }
+
+
+  // -- Process the reports that don't require a device
+  boost::property_tree::ptree ptSystem;
+  for (const auto & report : _reportsToProcess) {
+    if (report->isDeviceRequired() == true)
+      continue;
+
+    boost::any output = report->getFormattedReport(nullptr, _schemaVersion, _elementFilter);
+
+    // Simple string output
+    if (output.type() == typeid(std::string)) 
+      _ostream << boost::any_cast<std::string>(output);
+
+    if (output.type() == typeid(boost::property_tree::ptree)) {
+      boost::property_tree::ptree ptReport = boost::any_cast< boost::property_tree::ptree>(output);
+
+      // Only support 1 node on the root
+      if (ptReport.size() > 1)
+        throw xrt_core::error((boost::format("Invalid JSON - The report '%s' has too many root nodes.") % Report::getSchemaDescription(_schemaVersion).optionName).str());
+
+      // We have 1 node, copy the child to the root property tree
+      if (ptReport.size() == 1) {
+        for (const auto & ptChild : ptReport) {
+          ptSystem.add_child(ptChild.first, ptChild.second);
+        }
+      }
+    }
+  }
+  if (!ptSystem.empty()) 
+    ptRoot.add_child("system", ptSystem);
+
+  // -- Process reports that work on a device
+  boost::property_tree::ptree ptDevices;
+  for (const auto & device : _devices) {
+    boost::property_tree::ptree ptDevice;
+    for (auto &report : _reportsToProcess) {
+      if (report->isDeviceRequired() == false)
+        continue;
+
+      boost::any output = report->getFormattedReport(device.get(), _schemaVersion, _elementFilter);
+
+      // Simple string output
+      if (output.type() == typeid(std::string)) 
+        _ostream << boost::any_cast<std::string>(output);
+
+      if (output.type() == typeid(boost::property_tree::ptree)) {
+        boost::property_tree::ptree ptReport = boost::any_cast< boost::property_tree::ptree>(output);
+
+        // Only support 1 node on the root
+        if (ptReport.size() > 1)
+          throw xrt_core::error((boost::format("Invalid JSON - The report '%s' has too many root nodes.") % Report::getSchemaDescription(_schemaVersion).optionName).str());
+
+        // We have 1 node, copy the child to the root property tree
+        if (ptReport.size() == 1) {
+          for (const auto & ptChild : ptReport) {
+            ptDevice.add_child(ptChild.first, ptChild.second);
+          }
+        }
+      }
+    }
+    if (!ptDevice.empty()) 
+      ptDevices.push_back(std::make_pair("", ptDevice));   // Used to make an array of objects
+  }
+  if (!ptDevices.empty())
+    ptRoot.add_child("devices", ptDevices);
+
+
+  // Did we add anything to the property tree.  If so, then write it out.
+  if ((_schemaVersion != Report::SchemaVersion::text) &&
+      (_schemaVersion != Report::SchemaVersion::unknown)) {
+    // Write out JSON format
+    std::ostringstream outputBuffer;
+    boost::property_tree::write_json(outputBuffer, ptRoot, true /*Pretty print*/);
+    _ostream << outputBuffer.str() << std::endl;
+  }
 }
 

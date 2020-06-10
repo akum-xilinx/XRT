@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2016-2019 Xilinx, Inc. All rights reserved.
+ * Copyright (C) 2016-2020 Xilinx, Inc. All rights reserved.
  *
  * Authors: Lizhi.Hou@Xilinx.com
  *          Jan Stephan <j.stephan@hzdr.de>
@@ -21,9 +21,24 @@
 #if LINUX_VERSION_CODE <= KERNEL_VERSION(3, 0, 0)
 #include <drm/drm_backport.h>
 #endif
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 5, 0)
 #include <drm/drmP.h>
+#else
+#include <drm/drm_device.h>
+#include <drm/drm_file.h>
+#include <drm/drm_ioctl.h>
+#include <drm/drm_drv.h>
+#endif
 #include <drm/drm_gem.h>
 #include <drm/drm_mm.h>
+#include <linux/interrupt.h>
+#include <linux/poll.h>
+#include <linux/platform_device.h>
+#include <linux/pci.h>
+#include <linux/delay.h>
+#include <linux/types.h>
+#include <linux/moduleparam.h>
+#include <linux/cdev.h>
 #include "xclbin.h"
 #include "xrt_mem.h"
 #include "devices.h"
@@ -33,6 +48,12 @@
 #include <linux/libfdt_env.h>
 #include "lib/libfdt/libfdt.h"
 #include <linux/firmware.h>
+#include "kds_core.h"
+#include "xrt_cu.h"
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
+#define ioremap_nocache		ioremap
+#endif
 
 #ifndef mmiowb
 #define mmiowb()		do { } while (0)
@@ -96,6 +117,12 @@
 /* access_ok lost its first parameter with Linux 5.0. */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,0,0)
 	#define XOCL_ACCESS_OK(TYPE, ADDR, SIZE) access_ok(ADDR, SIZE)
+#elif defined(RHEL_RELEASE_CODE)
+        #if RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(8,1)
+                #define XOCL_ACCESS_OK(TYPE, ADDR, SIZE) access_ok(ADDR, SIZE)
+        #else
+                #define XOCL_ACCESS_OK(TYPE, ADDR, SIZE) access_ok(TYPE, ADDR, SIZE)
+        #endif
 #else
 	#define XOCL_ACCESS_OK(TYPE, ADDR, SIZE) access_ok(TYPE, ADDR, SIZE)
 #endif
@@ -162,14 +189,17 @@ static inline void xocl_memcpy_toio(void *iomem, void *buf, u32 size)
 
 #define	XDEV2DEV(xdev)		(&XDEV(xdev)->pdev->dev)
 
+#define PDEV(dev)	(((dev)->bus == &platform_bus_type && (dev)->parent) ? (dev)->parent : (dev))
+#define PNAME(dev)	(((dev)->bus == &pci_bus_type) ? "" : dev_name(dev))
+
 #define xocl_err(dev, fmt, args...)			\
-	dev_err(dev, "dev %llx, %s: "fmt, (u64)dev, __func__, ##args)
+	dev_err(PDEV(dev), "%s %llx %s: "fmt, PNAME(dev), (u64)dev, __func__, ##args)
 #define xocl_warn(dev, fmt, args...)			\
-	dev_warn(dev, "dev %llx, %s: "fmt, (u64)dev, __func__, ##args)
+	dev_warn(PDEV(dev), "%s %llx %s: "fmt, PNAME(dev), (u64)dev, __func__, ##args)
 #define xocl_info(dev, fmt, args...)			\
-	dev_info(dev, "dev %llx, %s: "fmt, (u64)dev, __func__, ##args)
+	dev_info(PDEV(dev), "%s %llx %s: "fmt, PNAME(dev), (u64)dev, __func__, ##args)
 #define xocl_dbg(dev, fmt, args...)			\
-	dev_dbg(dev, "dev %llx, %s: "fmt, (u64)dev, __func__, ##args)
+	dev_dbg(PDEV(dev), "%s %llx %s: "fmt, PNAME(dev), (u64)dev, __func__, ##args)
 
 #define xocl_xdev_info(xdev, fmt, args...)		\
 	xocl_info(XDEV2DEV(xdev), fmt, ##args)
@@ -281,8 +311,9 @@ struct xocl_subdev {
 	int				inst;
 	int				pf;
 	struct cdev			*cdev;
+	bool				hold;
 
-        struct resource		res[XOCL_SUBDEV_MAX_RES];
+	struct resource		res[XOCL_SUBDEV_MAX_RES];
 	char	res_name[XOCL_SUBDEV_MAX_RES][XOCL_SUBDEV_RES_NAME_LEN];
 	char			bar_idx[XOCL_SUBDEV_MAX_RES];
 };
@@ -361,6 +392,7 @@ enum {
 	XOCL_WORK_REFRESH_SUBDEV,
 	XOCL_WORK_SHUTDOWN,
 	XOCL_WORK_FORCE_RESET,
+	XOCL_WORK_ONLINE,
 	XOCL_WORK_NUM,
 };
 
@@ -394,6 +426,7 @@ struct xocl_dev_core {
 	struct xocl_drm		*drm;
 
 	char			*fdt_blob;
+	char			*blp_blob;
 	u32			fdt_blob_sz;
 	struct xocl_board_private priv;
 	char			vbnv_cache[256];
@@ -406,6 +439,8 @@ struct xocl_dev_core {
 	struct workqueue_struct	*wq;
 	struct xocl_work	works[XOCL_WORK_NUM];
 	struct mutex		wq_lock;
+
+	struct kds_sched	kds;
 
 	spinlock_t		api_lock;
 	struct completion	api_comp;
@@ -460,8 +495,8 @@ struct xocl_rom_funcs {
 	u64 (*get_timestamp)(struct platform_device *pdev);
 	int (*get_raw_header)(struct platform_device *pdev, void *header);
 	bool (*runtime_clk_scale_on)(struct platform_device *pdev);
-	int (*find_firmware)(struct platform_device *pdev, char *fw_name,
-		size_t len, u16 deviceid, const struct firmware **fw);
+	int (*load_firmware)(struct platform_device *pdev, char **fw,
+		size_t *fw_size);
 	bool (*passthrough_virtualization_on)(struct platform_device *pdev);
 	char *(*get_uuid)(struct platform_device *pdev);
 };
@@ -499,9 +534,9 @@ struct xocl_rom_funcs {
 #define	xocl_get_raw_header(xdev, header) \
 	(ROM_CB(xdev, get_raw_header) ? ROM_OPS(xdev)->get_raw_header(ROM_DEV(xdev), header) :\
 	-ENODEV)
-#define xocl_rom_find_firmware(xdev, fw_name, len, deviceid, fw)	\
-	(ROM_CB(xdev, find_firmware) ? ROM_OPS(xdev)->find_firmware(	\
-	ROM_DEV(xdev), fw_name, len, deviceid, fw) : -ENODEV)
+#define xocl_rom_load_firmware(xdev, fw, len)	\
+	(ROM_CB(xdev, load_firmware) ?		\
+	ROM_OPS(xdev)->load_firmware(ROM_DEV(xdev), fw, len) : -ENODEV)
 #define xocl_passthrough_virtualization_on(xdev)		\
 	(ROM_CB(xdev, passthrough_virtualization_on) ?		\
 	ROM_OPS(xdev)->passthrough_virtualization_on(ROM_DEV(xdev)) : false)
@@ -612,44 +647,6 @@ struct xocl_mb_scheduler_funcs {
 	MB_SCHEDULER_DEV(xdev), cu, filep, addrp) :		\
 	-ENODEV)
 
-#define XOCL_GET_MEM_TOPOLOGY(xdev, mem_topo)						\
-	(xocl_icap_get_xclbin_metadata(xdev, MEMTOPO_AXLF, (void **)&mem_topo))
-
-#define XOCL_GET_IP_LAYOUT(xdev, ip_layout)						\
-	(xocl_icap_get_xclbin_metadata(xdev, IPLAYOUT_AXLF, (void **)&ip_layout))
-#define XOCL_GET_XCLBIN_ID(xdev, xclbin_id)						\
-	(xocl_icap_get_xclbin_metadata(xdev, XCLBIN_UUID, (void **)&xclbin_id))
-
-
-#define XOCL_PUT_MEM_TOPOLOGY(xdev)						\
-	xocl_icap_put_xclbin_metadata(xdev)
-#define XOCL_PUT_IP_LAYOUT(xdev)						\
-	xocl_icap_put_xclbin_metadata(xdev)
-#define XOCL_PUT_XCLBIN_ID(xdev)						\
-	xocl_icap_put_xclbin_metadata(xdev)
-
-#define XOCL_IS_DDR_USED(topo, ddr) 			\
-	(topo->m_mem_data[ddr].m_used == 1)
-
-#define	XOCL_DDR_COUNT_UNIFIED(xdev)		\
-({ \
-	struct mem_topology *topo = NULL; \
-	uint32_t ret = 0; 	\
-	int err = XOCL_GET_MEM_TOPOLOGY(xdev, topo); \
-	if (err)	\
-		return 0;		\
-	ret = topo ? topo->m_count : 0; \
-	XOCL_PUT_MEM_TOPOLOGY(xdev); \
-	(ret); \
-})
-
-#define	XOCL_DDR_COUNT(xdev)			\
-	((xocl_is_unified(xdev) ? XOCL_DDR_COUNT_UNIFIED(xdev) :	\
-	xocl_get_ddr_channel_count(xdev)))
-#define XOCL_IS_STREAM(topo, idx)					\
-	(topo->m_mem_data[idx].m_type == MEM_STREAMING || \
-	 topo->m_mem_data[idx].m_type == MEM_STREAMING_CONNECTION)
-
 /* sysmon callbacks */
 enum {
 	XOCL_SYSMON_PROP_TEMP,
@@ -713,24 +710,24 @@ struct xocl_firewall_funcs {
 #define	xocl_af_get_data(xdev, buf)				\
 	(AF_CB(xdev, get_data) ? AF_OPS(xdev)->get_data(AF_DEV(xdev), buf) : -ENODEV)
 
+enum xocl_xmc_flags {
+	XOCL_MB_XMC = 0,
+	XOCL_MB_ERT,
+	XOCL_XMC_FREEZE,
+	XOCL_XMC_FREE,
+};
+
 /* microblaze callbacks */
 struct xocl_mb_funcs {
 	struct xocl_subdev_funcs common_funcs;
-	void (*reset)(struct platform_device *pdev);
+	int (*reset)(struct platform_device *pdev);
 	int (*stop)(struct platform_device *pdev);
 	int (*load_mgmt_image)(struct platform_device *pdev, const char *buf,
 		u32 len);
 	int (*load_sche_image)(struct platform_device *pdev, const char *buf,
 		u32 len);
 	int (*get_data)(struct platform_device *pdev, enum xcl_group_kind kind, void *buf);
-	int (*dr_freeze)(struct platform_device *pdev);
-	int (*dr_free)(struct platform_device *pdev);
-	int (*cmc_access)(struct platform_device *pdev, int flags);
-};
-
-enum {
-	MB_XMC,
-	MB_ERT,
+	int (*xmc_access)(struct platform_device *pdev, enum xocl_xmc_flags flags);
 };
 
 #define	MB_DEV(xdev)		\
@@ -741,7 +738,7 @@ enum {
 #define MB_CB(xdev, cb)	\
 	(MB_DEV(xdev) && MB_OPS(xdev) && MB_OPS(xdev)->cb)
 #define	xocl_xmc_reset(xdev)			\
-	(MB_CB(xdev, reset) ? MB_OPS(xdev)->reset(MB_DEV(xdev)) : NULL) \
+	(MB_CB(xdev, reset) ? MB_OPS(xdev)->reset(MB_DEV(xdev)) : -ENODEV) \
 
 #define	xocl_xmc_stop(xdev)			\
 	(MB_CB(xdev, stop) ? MB_OPS(xdev)->stop(MB_DEV(xdev)) : -ENODEV)
@@ -756,26 +753,21 @@ enum {
 #define xocl_xmc_get_data(xdev, kind, buf)			\
 	(MB_CB(xdev, get_data) ? MB_OPS(xdev)->get_data(MB_DEV(xdev), kind, buf) : -ENODEV)
 
-#define xocl_xmc_dr_freeze(xdev)		\
-	(MB_CB(xdev, dr_freeze) ? MB_OPS(xdev)->dr_freeze(MB_DEV(xdev)) : -ENODEV)
-#define xocl_xmc_dr_free(xdev)		\
-	(MB_CB(xdev, dr_free) ? MB_OPS(xdev)->dr_free(MB_DEV(xdev)) : -ENODEV)
-
-#define xocl_cmc_free(xdev) 		\
-	(MB_CB(xdev, cmc_access) ? MB_OPS(xdev)->cmc_access(MB_DEV(xdev), 1) : -ENODEV)
-#define xocl_cmc_freeze(xdev)		\
-	(MB_CB(xdev, cmc_access) ? MB_OPS(xdev)->cmc_access(MB_DEV(xdev), 0) : -ENODEV)
+#define xocl_xmc_freeze(xdev)		\
+	(MB_CB(xdev, xmc_access) ? MB_OPS(xdev)->xmc_access(MB_DEV(xdev), XOCL_XMC_FREEZE) : -ENODEV)
+#define xocl_xmc_free(xdev) 		\
+	(MB_CB(xdev, xmc_access) ? MB_OPS(xdev)->xmc_access(MB_DEV(xdev), XOCL_XMC_FREE) : -ENODEV)
 
 /* ERT FW callbacks */
 #define ERT_DEV(xdev)							\
-	SUBDEV_MULTI(xdev, XOCL_SUBDEV_MB, MB_ERT).pldev
+	SUBDEV_MULTI(xdev, XOCL_SUBDEV_MB, XOCL_MB_ERT).pldev
 #define ERT_OPS(xdev)							\
 	((struct xocl_mb_funcs *)SUBDEV_MULTI(xdev,			\
-	XOCL_SUBDEV_MB, MB_ERT).ops)
+	XOCL_SUBDEV_MB, XOCL_MB_ERT).ops)
 #define ERT_CB(xdev, cb)						\
 	(ERT_DEV(xdev) && ERT_OPS(xdev) && ERT_OPS(xdev)->cb)
 #define xocl_ert_reset(xdev)						\
-	(ERT_CB(xdev, reset) ? ERT_OPS(xdev)->reset(ERT_DEV(xdev)) : NULL)
+	(ERT_CB(xdev, reset) ? ERT_OPS(xdev)->reset(ERT_DEV(xdev)) : -ENODEV)
 #define xocl_ert_stop(xdev)						\
 	(ERT_CB(xdev, stop) ? ERT_OPS(xdev)->stop(ERT_DEV(xdev)) : -ENODEV)
 #define xocl_ert_load_sche_image(xdev, buf, len)			\
@@ -854,6 +846,41 @@ struct xocl_dna_funcs {
 	(DNA_CB(xdev, write_cert) ? DNA_OPS(xdev)->write_cert(DNA_DEV(xdev), data, len) : 0)
 #define xocl_dna_get_data(xdev, buf)  \
 	(DNA_CB(xdev, get_data) ? DNA_OPS(xdev)->get_data(DNA_DEV(xdev), buf) : 0)
+
+
+#define	ADDR_TRANSLATOR_DEV(xdev)		\
+	SUBDEV(xdev, XOCL_SUBDEV_ADDR_TRANSLATOR).pldev
+#define	ADDR_TRANSLATOR_OPS(xdev)		\
+	((struct xocl_addr_translator_funcs *)SUBDEV(xdev,	\
+	XOCL_SUBDEV_ADDR_TRANSLATOR).ops)
+#define ADDR_TRANSLATOR_CB(xdev, cb)	\
+	(ADDR_TRANSLATOR_DEV(xdev) && ADDR_TRANSLATOR_OPS(xdev) && ADDR_TRANSLATOR_OPS(xdev)->cb)
+#define	xocl_addr_translator_get_entries_num(xdev)			\
+	(ADDR_TRANSLATOR_CB(xdev, get_entries_num) ? ADDR_TRANSLATOR_OPS(xdev)->get_entries_num(ADDR_TRANSLATOR_DEV(xdev)) : 0)
+#define	xocl_addr_translator_set_page_table(xdev, addrs, sz, num)			\
+	(ADDR_TRANSLATOR_CB(xdev, set_page_table) ? ADDR_TRANSLATOR_OPS(xdev)->set_page_table(ADDR_TRANSLATOR_DEV(xdev), addrs, sz, num) : -ENODEV)
+#define	xocl_addr_translator_get_range(xdev)			\
+	(ADDR_TRANSLATOR_CB(xdev, get_range) ? ADDR_TRANSLATOR_OPS(xdev)->get_range(ADDR_TRANSLATOR_DEV(xdev)) : 0)
+#define	xocl_addr_translator_enable_remap(xdev, base_addr)			\
+	(ADDR_TRANSLATOR_CB(xdev, enable_remap) ? ADDR_TRANSLATOR_OPS(xdev)->enable_remap(ADDR_TRANSLATOR_DEV(xdev), base_addr) : -ENODEV)
+#define	xocl_addr_translator_disable_remap(xdev)			\
+	(ADDR_TRANSLATOR_CB(xdev, disable_remap) ? ADDR_TRANSLATOR_OPS(xdev)->disable_remap(ADDR_TRANSLATOR_DEV(xdev)) : -ENODEV)
+#define	xocl_addr_translator_clean(xdev)			\
+	(ADDR_TRANSLATOR_CB(xdev, clean) ? ADDR_TRANSLATOR_OPS(xdev)->clean(ADDR_TRANSLATOR_DEV(xdev)) : -ENODEV)
+#define	xocl_addr_translator_get_base_addr(xdev)			\
+	(ADDR_TRANSLATOR_CB(xdev, get_base_addr) ? ADDR_TRANSLATOR_OPS(xdev)->get_base_addr(ADDR_TRANSLATOR_DEV(xdev)) : 0)
+
+struct xocl_addr_translator_funcs {
+	struct xocl_subdev_funcs common_funcs;
+	u32 (*get_entries_num)(struct platform_device *pdev);
+	u64 (*get_range)(struct platform_device *pdev);
+	int (*set_page_table)(struct platform_device *pdev, uint64_t *phys_addrs, uint64_t entry_sz, uint32_t num);
+	int (*enable_remap)(struct platform_device *pdev, uint64_t base_addr);
+	int (*disable_remap)(struct platform_device *pdev);
+	int (*clean)(struct platform_device *pdev);
+	u64 (*get_base_addr)(struct platform_device *pdev);
+};
+
 /**
  *	data_kind
  */
@@ -930,6 +957,15 @@ enum data_kind {
 	EXP_BMC_VER,
 	XMC_OEM_ID,
 	XMC_VCCINT_TEMP,
+	XMC_12V_AUX1,
+	XMC_VCC1V2_I,
+	XMC_V12_IN_I,
+	XMC_V12_IN_AUX0_I,
+	XMC_V12_IN_AUX1_I,
+	XMC_VCCAUX,
+	XMC_VCCAUX_PMC,
+	XMC_VCCRAM,
+	DATA_RETAIN,
 };
 
 enum mb_kind {
@@ -979,14 +1015,6 @@ struct xocl_mailbox_funcs {
 	(MAILBOX_READY(xdev, get) ? MAILBOX_OPS(xdev)->get(MAILBOX_DEV(xdev), \
 	kind, data) : -ENODEV)
 
-struct gate_handler {
-	int (*gate_freeze_cb)(void *drvdata);
-	int (*gate_free_cb)(void *drvdata);
-	int (*gate_toggle_cb)(void *drvdata);
-	int (*gate_hbm_calibration_cb)(void *drvdata);
-	void *gate_args;
-};
-
 struct xocl_clock_funcs {
 	struct xocl_subdev_funcs common_funcs;
 	int (*freq_scaling)(struct platform_device *pdev, bool force);
@@ -997,9 +1025,9 @@ struct xocl_clock_funcs {
 	int (*get_freq_counter_khz)(struct platform_device *pdev,
 		unsigned int *value, int id);
 	int (*update_freq)(struct platform_device *pdev,
-		unsigned short *freqs, int num_freqs, int verify,
-		struct gate_handler *gate_handle);
+		unsigned short *freqs, int num_freqs, int verify);
 	int (*clock_status)(struct platform_device *pdev, bool *latched);
+	uint64_t (*get_data)(struct platform_device *pdev, enum data_kind kind);
 };
 #define CLOCK_DEV_INFO(xdev, idx)					\
 	SUBDEV_MULTI(xdev, XOCL_SUBDEV_CLOCK, idx).info
@@ -1044,31 +1072,38 @@ static inline int xocl_clock_ops_level(xdev_handle_t xdev)
 #define	xocl_clock_get_freq_by_id(xdev, region, freq, id)		\
 ({ \
 	int __idx = xocl_clock_ops_level(xdev);				\
-	(CLOCK_CB(xdev, __idx, get_freq_by_id) ?				\
+	(CLOCK_CB(xdev, __idx, get_freq_by_id) ?			\
 	CLOCK_OPS(xdev, __idx)->get_freq_by_id(CLOCK_DEV(xdev, __idx), region, freq, id) : \
 	-ENODEV); \
 })
 #define	xocl_clock_get_freq_counter_khz(xdev, value, id)		\
 ({ \
 	int __idx = xocl_clock_ops_level(xdev);				\
-	(CLOCK_CB(xdev, __idx, get_freq_counter_khz) ?				\
+	(CLOCK_CB(xdev, __idx, get_freq_counter_khz) ?			\
 	CLOCK_OPS(xdev, __idx)->get_freq_counter_khz(CLOCK_DEV(xdev, __idx), value, id) : \
 	-ENODEV); \
 })
-#define	xocl_clock_update_freq(xdev, freqs, num_freqs, verify, gate_handle) \
+#define	xocl_clock_update_freq(xdev, freqs, num_freqs, verify) \
 ({ \
 	int __idx = xocl_clock_ops_level(xdev);				\
-	(CLOCK_CB(xdev, __idx, update_freq) ?					\
-	CLOCK_OPS(xdev, __idx)->update_freq(CLOCK_DEV(xdev, __idx), freqs, num_freqs, verify, gate_handle) : \
+	(CLOCK_CB(xdev, __idx, update_freq) ?				\
+	CLOCK_OPS(xdev, __idx)->update_freq(CLOCK_DEV(xdev, __idx), freqs, num_freqs, verify) : \
 	-ENODEV); \
 })
 #define	xocl_clock_status(xdev, latched)				\
 ({ \
 	int __idx = xocl_clock_ops_level(xdev);				\
-	(CLOCK_CB(xdev, __idx, clock_status) ?					\
+	(CLOCK_CB(xdev, __idx, clock_status) ?				\
 	CLOCK_OPS(xdev, __idx)->clock_status(CLOCK_DEV(xdev, __idx), latched) : 	\
 	-ENODEV); \
 })
+#define	xocl_clock_get_data(xdev, kind)					\
+({ \
+	int __idx = xocl_clock_ops_level(xdev);				\
+	(CLOCK_CB(xdev, __idx, get_data) ?				\
+	CLOCK_OPS(xdev, __idx)->get_data(CLOCK_DEV(xdev, __idx), kind) : 0); 	\
+})
+
 
 struct xocl_icap_funcs {
 	struct xocl_subdev_funcs common_funcs;
@@ -1084,6 +1119,7 @@ struct xocl_icap_funcs {
 	int (*ocl_get_freq)(struct platform_device *pdev,
 		unsigned int region, unsigned short *freqs, int num_freqs);
 	int (*ocl_update_clock_freq_topology)(struct platform_device *pdev, struct xclmgmt_ioc_freqscaling *freqs);
+	int (*xclbin_validate_clock_req)(struct platform_device *pdev, struct drm_xocl_reclock_info *freqs);
 	int (*ocl_lock_bitstream)(struct platform_device *pdev,
 		const xuid_t *uuid);
 	int (*ocl_unlock_bitstream)(struct platform_device *pdev,
@@ -1093,6 +1129,8 @@ struct xocl_icap_funcs {
 	int (*get_xclbin_metadata)(struct platform_device *pdev,
 		enum data_kind kind, void **buf);
 	void (*put_xclbin_metadata)(struct platform_device *pdev);
+	int (*mig_calibration)(struct platform_device *pdev);
+	void (*clean_bitstream)(struct platform_device *pdev);
 };
 enum {
 	RP_DOWNLOAD_NORMAL,
@@ -1137,6 +1175,10 @@ enum {
 	(ICAP_CB(xdev, ocl_update_clock_freq_topology) ?		\
 	ICAP_OPS(xdev)->ocl_update_clock_freq_topology(ICAP_DEV(xdev), freqs) :\
 	-ENODEV)
+#define	xocl_icap_xclbin_validate_clock_req(xdev, freqs)		\
+	(ICAP_CB(xdev, xclbin_validate_clock_req) ?			\
+	ICAP_OPS(xdev)->xclbin_validate_clock_req(ICAP_DEV(xdev), freqs) :\
+	-ENODEV)
 #define	xocl_icap_lock_bitstream(xdev, uuid)				\
 	(ICAP_CB(xdev, ocl_lock_bitstream) ?				\
 	ICAP_OPS(xdev)->ocl_lock_bitstream(ICAP_DEV(xdev), uuid) :	\
@@ -1155,11 +1197,64 @@ enum {
 #define	xocl_icap_get_xclbin_metadata(xdev, kind, buf)			\
 	(ICAP_CB(xdev, get_xclbin_metadata) ?				\
 	ICAP_OPS(xdev)->get_xclbin_metadata(ICAP_DEV(xdev), kind, buf) :	\
-	0)
+	-ENODEV)
 #define	xocl_icap_put_xclbin_metadata(xdev)			\
-	(ICAP_CB(xdev, put_xclbin_metadata) ?				\
+	(ICAP_CB(xdev, put_xclbin_metadata) ?			\
 	ICAP_OPS(xdev)->put_xclbin_metadata(ICAP_DEV(xdev)) : 	\
 	0)
+#define	xocl_icap_mig_calibration(xdev)				\
+	(ICAP_CB(xdev, mig_calibration) ?			\
+	ICAP_OPS(xdev)->mig_calibration(ICAP_DEV(xdev)) : 	\
+	-ENODEV)
+#define	xocl_icap_clean_bitstream(xdev)				\
+	(ICAP_CB(xdev, clean_bitstream) ?			\
+	ICAP_OPS(xdev)->clean_bitstream(ICAP_DEV(xdev)) : 	\
+	-ENODEV)
+
+#define XOCL_GET_MEM_TOPOLOGY(xdev, mem_topo)						\
+	(xocl_icap_get_xclbin_metadata(xdev, MEMTOPO_AXLF, (void **)&mem_topo))
+
+#define XOCL_GET_IP_LAYOUT(xdev, ip_layout)						\
+	(xocl_icap_get_xclbin_metadata(xdev, IPLAYOUT_AXLF, (void **)&ip_layout))
+#define XOCL_GET_XCLBIN_ID(xdev, xclbin_id)						\
+	(xocl_icap_get_xclbin_metadata(xdev, XCLBIN_UUID, (void **)&xclbin_id))
+
+
+#define XOCL_PUT_MEM_TOPOLOGY(xdev)						\
+	xocl_icap_put_xclbin_metadata(xdev)
+#define XOCL_PUT_IP_LAYOUT(xdev)						\
+	xocl_icap_put_xclbin_metadata(xdev)
+#define XOCL_PUT_XCLBIN_ID(xdev)						\
+	xocl_icap_put_xclbin_metadata(xdev)
+
+#define XOCL_IS_DDR_USED(topo, ddr) 			\
+	(topo->m_mem_data[ddr].m_used == 1)
+
+static inline u32 xocl_ddr_count_unified(xdev_handle_t xdev_hdl)
+{
+	struct mem_topology *topo = NULL;
+	uint32_t ret = 0;
+	int err = XOCL_GET_MEM_TOPOLOGY(xdev_hdl, topo);
+
+	if (err)
+		return 0;
+	ret = topo ? topo->m_count : 0;
+	XOCL_PUT_MEM_TOPOLOGY(xdev_hdl);
+
+	return ret;
+}
+
+#define	XOCL_DDR_COUNT(xdev)			\
+	(xocl_is_unified(xdev) ? xocl_ddr_count_unified(xdev) :	\
+	xocl_get_ddr_channel_count(xdev))
+#define XOCL_IS_STREAM(topo, idx)					\
+	(topo->m_mem_data[idx].m_type == MEM_STREAMING || \
+	 topo->m_mem_data[idx].m_type == MEM_STREAMING_CONNECTION)
+#define XOCL_IS_P2P_MEM(topo, idx)					\
+	(topo->m_mem_data[idx].m_type == MEM_DDR3 ||			\
+	 topo->m_mem_data[idx].m_type == MEM_DDR4 ||			\
+	 topo->m_mem_data[idx].m_type == MEM_DRAM ||			\
+	 topo->m_mem_data[idx].m_type == MEM_HBM)
 
 struct xocl_mig_label {
 	unsigned char		tag[16];
@@ -1252,6 +1347,8 @@ struct xocl_axigate_funcs {
 	struct xocl_subdev_funcs common_funcs;
 	int (*freeze)(struct platform_device *pdev);
 	int (*free)(struct platform_device *pdev);
+	int (*reset)(struct platform_device *pdev);
+	int (*get_status)(struct platform_device *pdev, u32 *status);
 };
 
 #define AXIGATE_DEV(xdev, idx)			\
@@ -1270,11 +1367,22 @@ struct xocl_axigate_funcs {
 	(AXIGATE_CB(xdev, level, free) ?		\
 	AXIGATE_OPS(xdev, level)->free(AXIGATE_DEV(xdev, level)) :	\
 	-ENODEV)
+#define xocl_axigate_reset(xdev, level)		\
+	(AXIGATE_CB(xdev, level, reset) ?		\
+	AXIGATE_OPS(xdev, level)->reset(AXIGATE_DEV(xdev, level)) :	\
+	-ENODEV)
+#define xocl_axigate_status(xdev, level, status)		\
+	(AXIGATE_CB(xdev, level, get_status) ?		\
+	AXIGATE_OPS(xdev, level)->get_status(AXIGATE_DEV(xdev, level), status) :\
+	-ENODEV)
 
 struct xocl_mailbox_versal_funcs {
 	struct xocl_subdev_funcs common_funcs;
 	int (*set)(struct platform_device *pdev, u32 data);
 	int (*get)(struct platform_device *pdev, u32 *data);
+	int (*enable_intr)(struct platform_device *pdev);
+	int (*disable_intr)(struct platform_device *pdev);
+	int (*handle_intr)(struct platform_device *pdev);
 };
 #define	MAILBOX_VERSAL_DEV(xdev)	\
 	SUBDEV(xdev, XOCL_SUBDEV_MAILBOX_VERSAL).pldev
@@ -1292,6 +1400,108 @@ struct xocl_mailbox_versal_funcs {
 	(MAILBOX_VERSAL_READY(xdev, get)	\
 	? MAILBOX_VERSAL_OPS(xdev)->get(MAILBOX_VERSAL_DEV(xdev), \
 	data) : -ENODEV)
+#define	xocl_mailbox_versal_enable_intr(xdev)	\
+	(MAILBOX_VERSAL_READY(xdev, enable_intr)	\
+	? MAILBOX_VERSAL_OPS(xdev)->enable_intr(MAILBOX_VERSAL_DEV(xdev)) : -ENODEV)
+#define	xocl_mailbox_versal_disable_intr(xdev)	\
+	(MAILBOX_VERSAL_READY(xdev, disable_intr)	\
+	? MAILBOX_VERSAL_OPS(xdev)->disable_intr(MAILBOX_VERSAL_DEV(xdev)) : -ENODEV)
+#define	xocl_mailbox_versal_handle_intr(xdev)	\
+	(MAILBOX_VERSAL_READY(xdev, handle_intr)	\
+	? MAILBOX_VERSAL_OPS(xdev)->handle_intr(MAILBOX_VERSAL_DEV(xdev)) : -ENODEV)
+
+/* srsr callbacks */
+struct xocl_srsr_funcs {
+	struct xocl_subdev_funcs common_funcs;
+	int (*save_calib)(struct platform_device *pdev);
+	int (*calib)(struct platform_device *pdev, bool retain);
+	int (*write_calib)(struct platform_device *pdev, const void *calib_cache, uint32_t size);
+	int (*read_calib)(struct platform_device *pdev, void *calib_cache, uint32_t size);
+	uint32_t (*cache_size)(struct platform_device *pdev);
+};
+
+#define	SRSR_DEV(xdev, idx)	SUBDEV_MULTI(xdev, XOCL_SUBDEV_SRSR, idx).pldev
+#define	SRSR_OPS(xdev, idx)							\
+	((struct xocl_srsr_funcs *)SUBDEV_MULTI(xdev, XOCL_SUBDEV_SRSR, idx).ops)
+#define	SRSR_CB(xdev, idx)	\
+	(SRSR_DEV(xdev, idx) && SRSR_OPS(xdev, idx))
+#define	xocl_srsr_reset(xdev, idx)				\
+	(SRSR_CB(xdev, idx) ?						\
+	SRSR_OPS(xdev, idx)->reset(SRSR_DEV(xdev, idx)) : \
+	-ENODEV)
+#define	xocl_srsr_save_calib(xdev, idx)				\
+	(SRSR_CB(xdev, idx) ?						\
+	SRSR_OPS(xdev, idx)->save_calib(SRSR_DEV(xdev, idx)) : \
+	-ENODEV)
+#define	xocl_srsr_calib(xdev, idx, retain)				\
+	(SRSR_CB(xdev, idx) ?						\
+	SRSR_OPS(xdev, idx)->calib(SRSR_DEV(xdev, idx), retain) : \
+	-ENODEV)
+#define	xocl_srsr_write_calib(xdev, idx, calib_cache, size)				\
+	(SRSR_CB(xdev, idx) ?						\
+	SRSR_OPS(xdev, idx)->write_calib(SRSR_DEV(xdev, idx), calib_cache, size) : \
+	-ENODEV)
+#define	xocl_srsr_read_calib(xdev, idx, calib_cache, size)				\
+	(SRSR_CB(xdev, idx) ?						\
+	SRSR_OPS(xdev, idx)->read_calib(SRSR_DEV(xdev, idx), calib_cache, size) : \
+	-ENODEV)
+#define	xocl_srsr_cache_size(xdev, idx)				\
+	(SRSR_CB(xdev, idx) ?						\
+	SRSR_OPS(xdev, idx)->cache_size(SRSR_DEV(xdev, idx)) : 0)
+
+struct calib_storage_funcs {
+	struct xocl_subdev_funcs common_funcs;
+	int (*save)(struct platform_device *pdev);
+	int (*restore)(struct platform_device *pdev);
+};
+
+#define	CALIB_STORAGE_DEV(xdev)	SUBDEV(xdev, XOCL_SUBDEV_CALIB_STORAGE).pldev
+#define	CALIB_STORAGE_OPS(xdev)							\
+	((struct calib_storage_funcs *)SUBDEV(xdev, XOCL_SUBDEV_CALIB_STORAGE).ops)
+#define	CALIB_STORAGE_CB(xdev)	\
+	(CALIB_STORAGE_DEV(xdev) && CALIB_STORAGE_OPS(xdev))
+#define	xocl_calib_storage_save(xdev)				\
+	(CALIB_STORAGE_CB(xdev) ?						\
+	CALIB_STORAGE_OPS(xdev)->save(CALIB_STORAGE_DEV(xdev)) : \
+	-ENODEV)
+#define	xocl_calib_storage_restore(xdev)				\
+	(CALIB_STORAGE_CB(xdev) ?						\
+	CALIB_STORAGE_OPS(xdev)->restore(CALIB_STORAGE_DEV(xdev)) : \
+	-ENODEV)
+
+/* CU controller callback */
+struct xocl_kds_ctrl_funcs {
+	struct xocl_subdev_funcs common_funcs;
+	int (* add_cu)(struct platform_device *pdev, struct xrt_cu *xcu);
+	int (* remove_cu)(struct platform_device *pdev, struct xrt_cu *xcu);
+};
+#define CU_CTRL_DEV(xdev) \
+	SUBDEV(xdev, XOCL_SUBDEV_CU_CTRL).pldev
+#define CU_CTRL_OPS(xdev) \
+	((struct xocl_kds_ctrl_funcs *)SUBDEV(xdev, XOCL_SUBDEV_CU_CTRL).ops)
+#define CU_CTRL_CB(xdev, cb) \
+	(CU_CTRL_DEV(xdev) && CU_CTRL_OPS(xdev) && CU_CTRL_OPS(xdev)->cb)
+#define xocl_cu_ctrl_add_cu(xdev, xcu) \
+	(CU_CTRL_CB(xdev, add_cu)? \
+	 CU_CTRL_OPS(xdev)->add_cu(CU_CTRL_DEV(xdev), xcu) : -ENXIO)
+#define xocl_cu_ctrl_remove_cu(xdev, xcu) \
+	(CU_CTRL_CB(xdev, remove_cu)? \
+	 CU_CTRL_OPS(xdev)->remove_cu(CU_CTRL_DEV(xdev), xcu) : 0)
+
+/* CU callback */
+struct xocl_cu_funcs {
+	struct xocl_subdev_funcs common_funcs;
+	int (* submit)(struct platform_device *pdev, struct kds_command *xcmd);
+};
+#define CU_DEV(xdev, idx) \
+	SUBDEV_MULTI(xdev, XOCL_SUBDEV_CU, idx).pldev
+#define CU_OPS(xdev, idx) \
+	((struct xocl_cu_funcs *)SUBDEV_MULTI(xdev, XOCL_SUBDEV_CU, idx).ops)
+#define CU_CB(xdev, idx, cb) \
+	(CU_DEV(xdev, idx) && CU_OPS(xdev, idx) && CU_OPS(xdev, idx)->cb)
+#define xocl_cu_submit_xcmd(xdev, idx, xcmd) \
+	(CU_CB(xdev, idx, submit)? \
+	 CU_OPS(xdev, idx)->submit(CU_DEV(xdev, idx), xcmd) : -ENXIO)
 
 /* helper functions */
 xdev_handle_t xocl_get_xdev(struct platform_device *pdev);
@@ -1330,6 +1540,37 @@ static inline void xocl_queue_destroy(xdev_handle_t xdev_hdl)
 	mutex_unlock(&xdev->wq_lock);
 }
 
+struct xocl_flash_funcs {
+	struct xocl_subdev_funcs common_funcs;
+	int (*read)(struct platform_device *pdev,
+		char *buf, size_t n, loff_t off);
+	int (*get_size)(struct platform_device *pdev, size_t *size);
+};
+#define	FLASH_DEV(xdev)	SUBDEV(xdev, XOCL_SUBDEV_FLASH).pldev
+#define	FLASH_OPS(xdev)				\
+	((struct xocl_flash_funcs *)SUBDEV(xdev, XOCL_SUBDEV_FLASH).ops)
+#define	FLASH_CB(xdev)	(FLASH_DEV(xdev) && FLASH_OPS(xdev))
+#define	xocl_flash_read(xdev, buf, n, off)	\
+	(FLASH_CB(xdev) ?			\
+	FLASH_OPS(xdev)->read(FLASH_DEV(xdev), buf, n, off) : -ENODEV)
+#define	xocl_flash_get_size(xdev, size)		\
+	(FLASH_CB(xdev) ?			\
+	FLASH_OPS(xdev)->get_size(FLASH_DEV(xdev), size) : -ENODEV)
+
+struct xocl_xfer_versal_funcs {
+	int (*download_axlf)(struct platform_device *pdev,
+		const void __user *arg);
+};
+
+#define	XFER_VERSAL_DEV(xdev)	SUBDEV(xdev, XOCL_SUBDEV_XFER_VERSAL).pldev
+#define	XFER_VERSAL_OPS(xdev)					\
+	((struct xocl_xfer_versal_funcs *)SUBDEV(xdev, XOCL_SUBDEV_XFER_VERSAL).ops)
+#define	XFER_VERSAL_CB(xdev)	(XFER_VERSAL_DEV(xdev) && XFER_VERSAL_OPS(xdev))
+#define	xocl_xfer_versal_download_axlf(xdev, xclbin)	\
+	(XFER_VERSAL_CB(xdev) ?					\
+	XFER_VERSAL_OPS(xdev)->download_axlf(XFER_VERSAL_DEV(xdev), xclbin) : -ENODEV)
+
+
 /* subdev mbx messages */
 #define XOCL_MSG_SUBDEV_VER	1
 #define XOCL_MSG_SUBDEV_DATA_LEN	(512 * 1024)
@@ -1338,7 +1579,48 @@ enum {
 	XOCL_MSG_SUBDEV_RTN_UNCHANGED = 1,
 	XOCL_MSG_SUBDEV_RTN_PARTIAL,
 	XOCL_MSG_SUBDEV_RTN_COMPLETE,
+	XOCL_MSG_SUBDEV_RTN_PENDINGPLP,
 };
+
+struct xocl_p2p_funcs {
+	struct xocl_subdev_funcs common_funcs;
+	int (*mem_map)(struct platform_device *pdev, ulong bank_addr,
+			ulong bank_size, ulong offset, ulong len,
+			ulong *bar_off);
+	int (*mem_unmap)(struct platform_device *pdev, ulong bar_off,
+			ulong len);
+	int (*mem_init)(struct platform_device *pdev);
+	int (*mem_cleanup)(struct platform_device *pdev);
+	int (*mem_get_pages)(struct platform_device *pdev,
+			ulong bar_off, ulong size,
+			struct page **pages, ulong npages);
+};
+#define	P2P_DEV(xdev)	SUBDEV(xdev, XOCL_SUBDEV_P2P).pldev
+#define	P2P_OPS(xdev)				\
+	((struct xocl_p2p_funcs *)SUBDEV(xdev, XOCL_SUBDEV_P2P).ops)
+#define	P2P_CB(xdev)	(P2P_DEV(xdev) && P2P_OPS(xdev))
+#define	xocl_p2p_mem_map(xdev, ba, bs, off, len, bar_off)	\
+	(P2P_CB(xdev) ?			\
+	P2P_OPS(xdev)->mem_map(P2P_DEV(xdev), ba, bs, off, len, bar_off) : \
+	-ENODEV)
+#define xocl_p2p_mem_unmap(xdev, bar_off, len)				\
+	(P2P_CB(xdev) ?							\
+	 P2P_OPS(xdev)->mem_unmap(P2P_DEV(xdev), bar_off, len) : -ENODEV)
+#define xocl_p2p_mem_init(xdev)						\
+	(P2P_CB(xdev) ?							\
+	 P2P_OPS(xdev)->mem_init(P2P_DEV(xdev)) : -ENODEV)
+#define xocl_p2p_mem_cleanup(xdev)						\
+	(P2P_CB(xdev) ?							\
+	 P2P_OPS(xdev)->mem_cleanup(P2P_DEV(xdev)) : -ENODEV)
+#define xocl_p2p_mem_get_pages(xdev, bar_off, len, pages, npages)	\
+	(P2P_CB(xdev) ?							\
+	 P2P_OPS(xdev)->mem_get_pages(P2P_DEV(xdev), bar_off, len,	\
+	 pages, npages) : -ENODEV)
+
+/* Each P2P chunk we set up must be at least 256MB */
+#define XOCL_P2P_CHUNK_SHIFT		28
+#define XOCL_P2P_CHUNK_SIZE		(1UL << XOCL_P2P_CHUNK_SHIFT)
+
 
 /* subdev functions */
 int xocl_subdev_init(xdev_handle_t xdev_hdl, struct pci_dev *pdev,
@@ -1355,6 +1637,7 @@ int xocl_subdev_offline_by_id(xdev_handle_t xdev_hdl, u32 id);
 int xocl_subdev_offline_by_level(xdev_handle_t xdev_hdl, int level);
 int xocl_subdev_online_all(xdev_handle_t xdev_hdl);
 int xocl_subdev_online_by_id(xdev_handle_t xdev_hdl, u32 id);
+int xocl_subdev_online_by_id_and_inst(xdev_handle_t xdev_hdl, u32 id, u32 inst_id);
 int xocl_subdev_online_by_level(xdev_handle_t xdev_hdl, int level);
 void xocl_subdev_destroy_by_id(xdev_handle_t xdev_hdl, u32 id);
 void xocl_subdev_destroy_by_level(xdev_handle_t xdev_hdl, int level);
@@ -1365,12 +1648,18 @@ int xocl_subdev_destroy_by_name(xdev_handle_t xdev_hdl, char *name);
 int xocl_subdev_destroy_prp(xdev_handle_t xdev);
 int xocl_subdev_create_prp(xdev_handle_t xdev);
 
-int xocl_subdev_vsec(xdev_handle_t xdev, u32 type, int *bar_idx, u64 *offset);
+int xocl_subdev_vsec(xdev_handle_t xdev, u32 type, int *bar_idx, u64 *offset,
+	u32 *verType);
 u32 xocl_subdev_vsec_read32(xdev_handle_t xdev, int bar, u64 offset);
 int xocl_subdev_create_vsec_devs(xdev_handle_t xdev);
+bool xocl_subdev_is_vsec(xdev_handle_t xdev);
+int xocl_subdev_get_level(struct platform_device *pdev);
 
-struct resource *xocl_subdev_get_ioresource(xdev_handle_t xdev_hdl,
-		char *res_name);
+void xocl_subdev_register(struct platform_device *pldev, void *ops);
+void xocl_subdev_unregister(struct platform_device *pldev);
+
+int xocl_subdev_get_resource(xdev_handle_t xdev_hdl,
+		char *res_name, u32 type, struct resource *res);
 
 void xocl_fill_dsa_priv(xdev_handle_t xdev_hdl, struct xocl_board_private *in);
 int xocl_xrt_version_check(xdev_handle_t xdev_hdl,
@@ -1387,14 +1676,12 @@ int xocl_wait_pci_status(struct pci_dev *pdev, u16 mask, u16 val, int timeout);
 
 static inline void xocl_lock_xdev(xdev_handle_t xdev)
 {
-	if (!mutex_is_locked(&XDEV(xdev)->lock))
-		mutex_lock(&XDEV(xdev)->lock);
+	mutex_lock(&XDEV(xdev)->lock);
 }
 
 static inline void xocl_unlock_xdev(xdev_handle_t xdev)
 {
-	if (mutex_is_locked(&XDEV(xdev)->lock))
-		mutex_unlock(&XDEV(xdev)->lock);
+	mutex_unlock(&XDEV(xdev)->lock);
 }
 
 static inline uint32_t xocl_dr_reg_read32(xdev_handle_t xdev, void __iomem *addr)
@@ -1413,6 +1700,11 @@ static inline void xocl_dr_reg_write32(xdev_handle_t xdev, u32 value, void __iom
 	read_lock(&XDEV(xdev)->rwlock);
 	iowrite32(value, addr);
 	read_unlock(&XDEV(xdev)->rwlock);
+}
+
+static inline void xocl_kds_setctrl(xdev_handle_t xdev, int type, struct kds_ctrl *ctrl)
+{
+	XDEV(xdev)->kds.ctrl[type] = ctrl;
 }
 
 /* context helpers */
@@ -1438,13 +1730,16 @@ int xocl_thread_start(xdev_handle_t xdev);
 int xocl_thread_stop(xdev_handle_t xdev);
 
 /* subdev blob functions */
-int xocl_fdt_blob_input(xdev_handle_t xdev_hdl, char *blob, u32 blob_sz);
+int xocl_fdt_blob_input(xdev_handle_t xdev_hdl, char *blob, u32 blob_sz,
+		int part_level, char *vbnv);
 int xocl_fdt_remove_subdevs(xdev_handle_t xdev_hdl, struct list_head *devlist);
 int xocl_fdt_unlink_node(xdev_handle_t xdev_hdl, void *node);
-int xocl_fdt_overlay(void *fdt, int target, void *fdto, int node, int pf);
+int xocl_fdt_overlay(void *fdt, int target, void *fdto, int node, int pf,
+		int part_level);
 int xocl_fdt_build_priv_data(xdev_handle_t xdev_hdl, struct xocl_subdev *subdev,
 		void **priv_data,  size_t *data_len);
 int xocl_fdt_get_userpf(xdev_handle_t xdev_hdl, void *blob);
+int xocl_fdt_get_p2pbar(xdev_handle_t xdev_hdl, void *blob);
 int xocl_fdt_add_pair(xdev_handle_t xdev_hdl, void *blob, char *name,
 		void *val, int size);
 int xocl_fdt_get_next_prop_by_name(xdev_handle_t xdev_hdl, void *blob,
@@ -1456,6 +1751,11 @@ int xocl_fdt_parse_blob(xdev_handle_t xdev_hdl, char *blob, u32 blob_sz,
 const struct axlf_section_header *xocl_axlf_section_header(
 	xdev_handle_t xdev_hdl, const struct axlf *top,
 	enum axlf_section_kind kind);
+int xocl_fdt_path_offset(xdev_handle_t xdev_hdl, void *blob, const char *path);
+int xocl_fdt_setprop(xdev_handle_t xdev_hdl, void *blob, int off,
+		     const char *name, const void *val, int size);
+const void *xocl_fdt_getprop(xdev_handle_t xdev_hdl, void *blob, int off,
+			     char *name, int *lenp);
 
 
 /* init functions */
@@ -1534,8 +1834,8 @@ void xocl_fini_iores(void);
 int __init xocl_init_mailbox_versal(void);
 void xocl_fini_mailbox_versal(void);
 
-int __init xocl_init_ospi_versal(void);
-void xocl_fini_ospi_versal(void);
+int __init xocl_init_xfer_versal(void);
+void xocl_fini_xfer_versal(void);
 
 int __init xocl_init_aim(void);
 void xocl_fini_aim(void);
@@ -1561,4 +1861,27 @@ void xocl_fini_trace_s2mm(void);
 int __init xocl_init_mem_hbm(void);
 void xocl_fini_mem_hbm(void);
 
+int __init xocl_init_srsr(void);
+void xocl_fini_srsr(void);
+
+int __init xocl_init_ulite(void);
+void xocl_fini_ulite(void);
+
+int __init xocl_init_calib_storage(void);
+void xocl_fini_calib_storage(void);
+
+int __init xocl_init_kds(void);
+void xocl_fini_kds(void);
+
+int __init xocl_init_cu_ctrl(void);
+void xocl_fini_cu_ctrl(void);
+
+int __init xocl_init_cu(void);
+void xocl_fini_cu(void);
+
+int __init xocl_init_addr_translator(void);
+void xocl_fini_addr_translator(void);
+
+int __init xocl_init_p2p(void);
+void xocl_fini_p2p(void);
 #endif

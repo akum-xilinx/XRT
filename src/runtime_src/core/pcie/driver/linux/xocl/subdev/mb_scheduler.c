@@ -68,6 +68,12 @@
 
 //#define SCHED_VERBOSE
 
+/* This is for performance test purpose.
+ * Use this with regular ap_ctrl_hs CUs and KDS mode.
+ * It is by default disabled.
+ */
+extern int kds_echo;
+
 #if defined(__GNUC__)
 #define SCHED_UNUSED __attribute__((unused))
 #endif
@@ -132,6 +138,22 @@ static void scheduler_wake_up(struct xocl_scheduler *xs);
 static void scheduler_intr(struct xocl_scheduler *xs);
 static void scheduler_decr_poll(struct xocl_scheduler *xs);
 static void scheduler_incr_poll(struct xocl_scheduler *xs);
+
+static inline u32
+cu_ioread32(void __iomem *addr, u32 val)
+{
+	if (kds_echo)
+		return val;
+	return ioread32(addr);
+}
+
+static inline void
+cu_iowrite32(u32 val, void __iomem *addr)
+{
+	if (kds_echo)
+		return;
+	iowrite32(val, addr);
+}
 
 /*
  */
@@ -250,8 +272,8 @@ struct xocl_cmd {
 	unsigned int chain_count;
 	unsigned int wait_count;
 	union {
-		struct xocl_cmd *chain[8];
-		struct drm_xocl_bo *deps[8];
+		struct xocl_cmd *chain[MAX_DEPS];
+		struct drm_xocl_bo *deps[MAX_DEPS];
 	};
 
 	bool          aborted;  // set to true if CU aborts the command
@@ -1094,7 +1116,7 @@ cu_continue(struct xocl_cu *xcu)
 static inline u32
 cu_status(struct xocl_cu *xcu)
 {
-	return ioread32(xcu->base + xcu->addr);
+	return cu_ioread32(xcu->base + xcu->addr, AP_DONE | AP_IDLE);
 }
 
 /**
@@ -1201,7 +1223,7 @@ cu_configure_ooo(struct xocl_cu *xcu, struct xocl_cmd *xcmd)
 		u32 val = *(regmap + idx + 1);
 
 		SCHED_DEBUGF("+ base[0x%x] = 0x%x\n", offset, val);
-		iowrite32(val, xcu->base + xcu->addr + offset);
+		cu_iowrite32(val, xcu->base + xcu->addr + offset);
 	}
 	SCHED_DEBUGF("<- %s\n", __func__);
 }
@@ -1218,7 +1240,7 @@ cu_configure_ino(struct xocl_cu *xcu, struct xocl_cmd *xcmd)
 
 	SCHED_DEBUGF("-> %s cu(%d) xcmd(%lu)\n", __func__, xcu->idx, xcmd->uid);
 	for (idx = 4; idx < size; ++idx)
-		iowrite32(*(regmap + idx), xcu->base + xcu->addr + (idx << 2));
+		cu_iowrite32(*(regmap + idx), xcu->base + xcu->addr + (idx << 2));
 	SCHED_DEBUGF("<- %s\n", __func__);
 }
 
@@ -1367,6 +1389,28 @@ ert_cfg(struct xocl_ert *xert, unsigned int cq_size, unsigned int num_slots, boo
 	bitmap_zero(xert->slot_status, MAX_SLOTS);
 	set_bit(0, xert->slot_status); // reserve for control command
 	xert->ctrl_busy = false;
+}
+
+/**
+ * Clear the ERT command queue status register
+ *
+ * This can be necessary in ert polling mode, where KDS itself
+ * can be ahead of ERT, so stale interrupts are possible which
+ * is bad during reconfig.
+ */
+static void
+ert_clear_csr(struct xocl_ert *xert)
+{
+        unsigned int idx;
+
+	for (idx = 0; idx < 4; ++idx) {
+		u32 csr_addr = ERT_STATUS_REGISTER_ADDR + (idx<<2);
+		u32 val = csr_read32(xert->csr_base, csr_addr);
+
+		if (val)
+                        userpf_info(xert->xdev,
+				    "csr[%d]=0x%x cleared\n", idx, val);
+	}
 }
 
 /*
@@ -1704,7 +1748,7 @@ struct exec_core {
 
 	u32			   intr_base;
 	u32			   intr_num;
-	char			   ert_cfg_priv;
+	struct xocl_ert_sched_privdata ert_cfg_priv;
 	bool			   needs_reset;
 
 	wait_queue_head_t	   poll_wait_queue;
@@ -1883,7 +1927,8 @@ exec_cfg_cmd(struct exec_core *exec, struct xocl_cmd *xcmd)
 {
 	struct xocl_dev *xdev = exec_get_xdev(exec);
 	uint32_t *cdma = xocl_rom_cdma_addr(xdev);
-	unsigned int dsa = exec->ert_cfg_priv;
+	unsigned int dsa = exec->ert_cfg_priv.dsa;
+	unsigned int major = exec->ert_cfg_priv.major;
 	struct ert_configure_cmd *cfg = xcmd->ert_cfg;
 	bool ert = XOCL_DSA_IS_VERSAL(xdev) ? 1 : xocl_mb_sched_on(xdev);
 	bool ert_full = (ert && cfg->ert && !cfg->dataflow);
@@ -1897,12 +1942,17 @@ exec_cfg_cmd(struct exec_core *exec, struct xocl_cmd *xcmd)
 		return 1;
 	}
 
+	if (major > 2) {
+		DRM_INFO("Unknown ERT major version, fallback to KDS mode\n");
+		ert_full = 0;
+		ert_poll = 0;
+	}
+
 	userpf_info(xdev, "ert per feature rom = %d", ert);
 	userpf_info(xdev, "dsa52 = %d", dsa);
 
 	if (XOCL_DSA_IS_VERSAL(xdev)) {
-		userpf_info(xdev, "force polling mode for versal");
-		cfg->polling = true;
+		userpf_info(xdev, "versal polling mode %d", cfg->polling);
 
 
 		// For versal device, we will use ert_full if we are
@@ -1916,6 +1966,12 @@ exec_cfg_cmd(struct exec_core *exec, struct xocl_cmd *xcmd)
 	cfg->type = ERT_CTRL;
 
 	SCHED_DEBUGF("configuring scheduler cq_size(%d)\n", exec->cq_size);
+	if (ert && (exec->cq_size == 0 || cfg->slot_size == 0)) {
+		userpf_err(xdev, "should not have zeroed value of cq_size=%d, slot_size=%d",
+		    exec->cq_size, cfg->slot_size);
+		return 1;
+	}
+
 	ert_num_slots = exec->cq_size / cfg->slot_size;
 	exec->num_cus = cfg->num_cus;
 	exec->num_cdma = 0;
@@ -2133,14 +2189,40 @@ exec_stop(struct exec_core *exec)
 		userpf_err(xdev, "unexpected outstanding commands %d after flush", outstanding);
 }
 
-/*
- */
+static irqreturn_t
+versal_isr(int irq, void *arg)
+{
+	struct exec_core *exec = (struct exec_core *)arg;
+	SCHED_DEBUGF("-> %s %d\n", __func__, irq);
+
+	if (exec) {
+		xocl_mailbox_versal_handle_intr(exec_get_xdev(exec));
+
+		if (!exec->polling_mode)
+			scheduler_intr(exec->scheduler);
+		else
+			userpf_err(exec_get_xdev(exec), "unhandled isr irq %d", irq);
+	}
+
+	SCHED_DEBUGF("<- %s\n", __func__);
+	return IRQ_HANDLED;
+}
+
 static irqreturn_t
 exec_isr(int irq, void *arg)
 {
 	struct exec_core *exec = (struct exec_core *)arg;
 
 	SCHED_DEBUGF("-> xocl_user_event %d\n", irq);
+
+	/*
+	 * versal_isr is registered here,
+	 * but versal interrupt is enabled by mailbox_versal subdev.
+	 * Note: should be separated from exec_isr in new scheduler.
+	 */
+	if (exec && XOCL_DSA_IS_VERSAL(exec_get_xdev(exec)))
+		return versal_isr(irq, arg);
+
 	if (exec && !exec->polling_mode) {
 
 		irq -= exec->intr_base;
@@ -2172,16 +2254,19 @@ exec_create(struct platform_device *pdev, struct xocl_scheduler *xs)
 	struct resource *res;
 	static unsigned int count;
 	unsigned int i;
+	struct xocl_ert_sched_privdata *priv;
 
 	if (!exec)
 		return NULL;
 
 	mutex_init(&exec->exec_lock);
 	exec->base = xdev->core.bar_addr;
-	if (XOCL_GET_SUBDEV_PRIV(&pdev->dev))
-		exec->ert_cfg_priv = *(char *)XOCL_GET_SUBDEV_PRIV(&pdev->dev);
-	else
-		xocl_info(&pdev->dev, "did not get private data");
+	if (XOCL_GET_SUBDEV_PRIV(&pdev->dev)) {
+		priv = XOCL_GET_SUBDEV_PRIV(&pdev->dev);
+		memcpy(&exec->ert_cfg_priv, priv, sizeof(*priv));
+	} else {
+		xocl_err(&pdev->dev, "did not get private data");
+	}
 
 	res = platform_get_resource(pdev, IORESOURCE_IRQ, 0);
 	if (res) {
@@ -2219,8 +2304,10 @@ exec_create(struct platform_device *pdev, struct xocl_scheduler *xs)
 	}
 
 	exec->pdev = pdev;
-	if (XOCL_GET_SUBDEV_PRIV(&pdev->dev))
-		exec->ert_cfg_priv = *(char *)XOCL_GET_SUBDEV_PRIV(&pdev->dev);
+	if (XOCL_GET_SUBDEV_PRIV(&pdev->dev)) {
+		priv = XOCL_GET_SUBDEV_PRIV(&pdev->dev);
+		memcpy(&exec->ert_cfg_priv, priv, sizeof(*priv));
+	}
 
 	init_waitqueue_head(&exec->poll_wait_queue);
 	exec->completion_wq = alloc_workqueue("xsched-compltn", WQ_HIGHPRI | WQ_MEM_RECLAIM | WQ_UNBOUND, num_online_cpus());
@@ -2614,6 +2701,7 @@ exec_ert_start_ctrl_cmd(struct exec_core *exec, struct xocl_cmd *xcmd)
 	// is nothing to do, mark complete immediately
 	if (cmd_opcode(xcmd) == ERT_CU_STAT && exec_is_ert_poll(exec)) {
 		exec_mark_cmd_complete(exec, xcmd);
+		cmd_free(xcmd);
 		return true;
 	}
 
@@ -2634,22 +2722,11 @@ exec_ert_start_ctrl_cmd(struct exec_core *exec, struct xocl_cmd *xcmd)
  * can be ahead of ERT, so stale interrupts are possible which
  * is bad during reconfig.
  */
-static void
+static inline void
 exec_ert_clear_csr(struct exec_core *exec)
 {
-	unsigned int idx;
-
-	if (!exec_is_ert(exec) && !exec_is_ert_poll(exec))
-		return;
-
-	for (idx = 0; idx < 4; ++idx) {
-		u32 csr_addr = ERT_STATUS_REGISTER_ADDR + (idx<<2);
-		u32 val = csr_read32(exec->csr_base, csr_addr);
-
-		if (val)
-			userpf_info(exec_get_xdev(exec),
-				    "csr[%d]=0x%x cleared\n", idx, val);
-	}
+	if (exec_is_ert(exec) || exec_is_ert_poll(exec))
+              ert_clear_csr(exec->ert);
 }
 
 /**
@@ -2690,7 +2767,7 @@ exec_ert_query_mailbox(struct exec_core *exec, struct xocl_cmd *xcmd)
 			continue;
 		}
 
-		mask = 1 << (slots[i] % sizeof (u32));
+		mask = 1 << (slots[i] % 32);
 		mask_idx = slots[i] >> 5;
 
 		exec->ops->process_mask(exec, mask, mask_idx);
@@ -3059,6 +3136,12 @@ exec_submit_cmd(struct exec_core *exec, struct xocl_cmd *xcmd)
 	bool ret = false;
 
 	SCHED_DEBUGF("-> %s exec(%d) cmd(%lu)\n", __func__, exec->uid, xcmd->uid);
+
+	if (cmd_wait_count(xcmd)) {
+		SCHED_DEBUGF("<- %s ret(false) cmd_wait_count(%d)\n", __func__, cmd_wait_count(xcmd));
+		return false;
+	}
+
 	if (cmd_update_state(xcmd) == ERT_CMD_STATE_ABORT)
 		exec_abort_cmd(exec, xcmd);
 	else if (cmd_type(xcmd) == ERT_CU)
@@ -3128,6 +3211,13 @@ exec_submitted_to_running(struct exec_core *exec)
 	started += exec_start_kds(exec);
 	started += exec_start_scu(exec);
 	exec->num_pending_cmds -= started;
+
+        // Force at least one iteration if in ert poll mode where kds can be
+        // ahead of ert polling.  A pending interrupt has to be cleared before
+        // new interrupts can be send by ERT.
+        if (started && exec_is_ert_poll(exec))
+          scheduler_intr(exec->scheduler);
+	
 	SCHED_DEBUGF("<- %s started(%d)\n", __func__, started);
 }
 
@@ -3355,11 +3445,19 @@ static struct xocl_scheduler scheduler0;
 static void
 scheduler_reset(struct xocl_scheduler *xs)
 {
+	struct list_head *pos, *next;
+
 	xs->error = false;
 	xs->stop = false;
 	xs->reset = false;
 	xs->poll = 0;
 	xs->intc = 0;
+
+	list_for_each_safe(pos, next, &xs->cores) {
+		struct exec_core *exec =
+			list_entry(pos, struct exec_core, core_list);
+		exec_reset_cmds(exec);
+	}
 }
 
 static void
@@ -3560,8 +3658,8 @@ add_xcmd(struct xocl_cmd *xcmd)
 	SCHED_DEBUGF("+ exec stopped(%d) configured(%d)\n", exec->stopped, exec->configured);
 
 	if (exec->stopped || (!exec->configured && cmd_opcode(xcmd) != ERT_CONFIGURE)) {
-		userpf_err(xdev, "scheduler can't add cmd(%lu) opcode(%d)\n",
-			   xcmd->uid, cmd_opcode(xcmd));
+		userpf_err(xdev, "scheduler can't add cmd(%lu) opcode(%d) exec stopped(%d) exec confgured(%d)\n",
+			   xcmd->uid, cmd_opcode(xcmd), exec->stopped, exec->configured);
 		goto err;
 	}
 
@@ -3728,24 +3826,16 @@ create_client(struct platform_device *pdev, void **priv)
 	if (!client)
 		return -ENOMEM;
 
+	client->pid = get_pid(task_pid(current));
+	client->abort = false;
+	atomic_set(&client->trigger, 0);
+	atomic_set(&client->outstanding_execs, 0);
+	client->num_cus = 0;
+	client->xdev = xocl_get_xdev(pdev);
 	mutex_lock(&xdev->dev_lock);
-
-	if (!xdev->offline) {
-		client->pid = get_pid(task_pid(current));
-		client->abort = false;
-		atomic_set(&client->trigger, 0);
-		atomic_set(&client->outstanding_execs, 0);
-		client->num_cus = 0;
-		client->xdev = xocl_get_xdev(pdev);
-		list_add_tail(&client->link, &xdev->ctx_list);
-		*priv =	client;
-	} else {
-		/* Do not allow new client to come in while being offline. */
-		devm_kfree(XDEV2DEV(xdev), client);
-		ret = -EBUSY;
-	}
-
+	list_add_tail(&client->link, &xdev->ctx_list);
 	mutex_unlock(&xdev->dev_lock);
+	*priv =	client;
 
 	DRM_INFO("creating scheduler client for pid(%d), ret: %d\n",
 		 pid_nr(task_tgid(current)), ret);
@@ -4452,6 +4542,13 @@ validate(struct platform_device *pdev, struct client_ctx *client, const struct d
 	if (bo_size < sizeof(*ecmd) ||
 		bo_size < sizeof(ecmd->header) + ecmd->count * sizeof(u32)) {
 		userpf_err(xocl_get_xdev(pdev), "exec buf is too small\n");
+		return 1;
+	}
+
+	// Filter unsupported opcodes
+	switch (ecmd->opcode) {
+	case ERT_INIT_CU:
+		userpf_err(xocl_get_xdev(pdev), "invalid opcode 'ERT_INIT_CU'\n");
 		return 1;
 	}
 

@@ -39,6 +39,14 @@
 #define PALIGN(p, a)    ((char *)(ALIGN((unsigned long)(p), (a))))
 #define GET_CELL(p)     (p += 4, *((const uint32_t *)(p-4)))
 
+enum p2p_config {
+    P2P_CONFIG_DISABLED,
+    P2P_CONFIG_ENABLED,
+    P2P_CONFIG_REBOOT,
+    P2P_CONFIG_NOT_SUPP,
+    P2P_CONFIG_ERROR,
+};
+
 struct fdt_header {
     uint32_t magic;
     uint32_t totalsize;
@@ -106,6 +114,8 @@ public:
         std::string& err_msg, const std::string& input);
     void sysfs_put(const std::string& subdev, const std::string& entry,
         std::string& err_msg, const std::vector<char>& buf);
+    void sysfs_put(const std::string& subdev, const std::string& entry,
+        std::string& err_msg, const unsigned int& buf);
     std::string get_sysfs_path(const std::string& subdev,
         const std::string& entry);
     std::string get_subdev_path(const std::string& subdev, uint32_t idx);
@@ -121,7 +131,6 @@ public:
     int munmap(int devhdl, void* addr, size_t len);
     int flock(int devhdl, int op);
     int get_partinfo(std::vector<std::string>& info, void *blob = nullptr);
-    int shutdown(bool remove_user = false, bool remove_mgmt = false);
     std::shared_ptr<pcidev::pci_device> lookup_peer_dev();
 
 private:
@@ -142,6 +151,8 @@ std::shared_ptr<pci_device> get_dev(unsigned index, bool user = true);
 int get_axlf_section(std::string filename, int kind, std::shared_ptr<char>& buf);
 int get_uuids(std::shared_ptr<char>& dtbbuf, std::vector<std::string>& uuids);
 std::shared_ptr<pcidev::pci_device> lookup_user_dev(std::shared_ptr<pcidev::pci_device> mgmt_dev);
+int shutdown(std::shared_ptr<pcidev::pci_device> mgmt_dev, bool remove_user = false, bool remove_mgmt = false);
+int check_p2p_config(std::shared_ptr<pcidev::pci_device> dev, std::string &err);
 } /* pcidev */
 
 // For print out per device info

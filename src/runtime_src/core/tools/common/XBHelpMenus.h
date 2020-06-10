@@ -20,7 +20,11 @@
 // Include files
 // Please keep these to the bare minimum
 #include "SubCmd.h"
+#include "Report.h"
+
 #include <string>
+#include <vector>
+#include <utility> // Pair template
 #include <boost/program_options.hpp>
 
 // ----------------------- T Y P E D E F S -----------------------------------
@@ -31,6 +35,7 @@ namespace XBUtilities {
     report_commands_help( const std::string &_executable, 
                           const std::string &_description,
                           const boost::program_options::options_description& _optionDescription,
+                          const boost::program_options::options_description& _optionHidden,
                           const SubCmdsCollection &_subCmds );
   void 
     report_subcommand_help( const std::string &_executableName,
@@ -38,6 +43,7 @@ namespace XBUtilities {
                             const std::string &_description, 
                             const std::string &_extendedHelp,
                             const boost::program_options::options_description & _optionDescription,
+                            const boost::program_options::options_description &_optionHidden,
                             const boost::program_options::positional_options_description & _positionalDescription );
 
   void 
@@ -46,6 +52,7 @@ namespace XBUtilities {
                             const std::string &_description, 
                             const std::string &_extendedHelp,
                             const boost::program_options::options_description &_optionDescription,
+                            const boost::program_options::options_description &_optionHidden,
                             const SubCmd::SubOptionOptions & _subOptionOptions);
 
   void 
@@ -54,9 +61,35 @@ namespace XBUtilities {
                         const boost::program_options::positional_options_description & _positionalDescription,
                         bool _bReportParameter = true);
 
-   std::string 
-     create_usage_string( const boost::program_options::options_description &_od,
-                          const boost::program_options::positional_options_description & _pod );
+  std::string 
+    create_usage_string( const boost::program_options::options_description &_od,
+                         const boost::program_options::positional_options_description & _pod );
+
+  std::string 
+    create_suboption_list_string(const ReportCollection &_reportCollection, bool _addAll = false);
+
+  using VectorPairStrings = std::vector< std::pair< std::string, std::string > >;
+
+  std::string 
+    create_suboption_list_string(const VectorPairStrings &_collection);
+
+  std::string 
+    create_suboption_list_string(const ReportCollection &_reportCollection, bool _addVerboseOption);
+
+  std::string 
+    create_suboption_list_string(const Report::SchemaDescriptionVector &_formatCollection);
+
+  void 
+    collect_and_validate_reports( const ReportCollection & allReportsAvailable,
+                                  const std::vector<std::string> &reportNamesToAdd,
+                                  ReportCollection & reportsToUse);
+
+  void 
+     produce_reports( xrt_core::device_collection _devices, 
+                      const ReportCollection & _reportsToProcess, 
+                      Report::SchemaVersion _schema, 
+                      std::vector<std::string> & _elementFilter,
+                      std::ostream &_ostream);
 };
 
 #endif

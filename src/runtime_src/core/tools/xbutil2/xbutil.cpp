@@ -16,20 +16,11 @@
 
 // Sub Commands
 #include "SubCmdExamine.h"
-#include "SubCmdClock.h"
-#include "SubCmdDD.h"
-#include "SubCmdDump.h"
 #include "SubCmdDmaTest.h"
-#include "SubCmdList.h"
-#include "SubCmdMem.h"
-#include "SubCmdM2MTest.h"
-#include "SubCmdP2P.h"
 #include "SubCmdProgram.h"
 #include "SubCmdQuery.h"
 #include "SubCmdReset.h"
 #include "SubCmdScan.h"
-#include "SubCmdTop.h"
-#include "SubCmdVersion.h"
 #include "SubCmdValidate.h"
 #include "SubCmdAdvanced.h"
 
@@ -52,35 +43,24 @@ int main( int argc, char** argv )
 
   {
     // Syntax: SubCmdClass( IsHidden, IsDepricated, IsPreliminary)
-    subCommands.emplace_back(std::make_shared<  SubCmdExamine >(false, false,  false));
-    subCommands.emplace_back(std::make_shared<  SubCmdProgram >(false, false,  false));
-    subCommands.emplace_back(std::make_shared< SubCmdValidate >(false, false,  false));
-    subCommands.emplace_back(std::make_shared< SubCmdAdvanced >(false, false, true));
-    subCommands.emplace_back(std::make_shared<    SubCmdReset >(false, false,  false));
+    subCommands.emplace_back(std::make_shared<  SubCmdExamine >(false, false, false));
+    subCommands.emplace_back(std::make_shared<  SubCmdProgram >(false, false, false));
+    subCommands.emplace_back(std::make_shared< SubCmdValidate >(true,  false, false));
+    subCommands.emplace_back(std::make_shared< SubCmdAdvanced >(true,  false, true ));
+    subCommands.emplace_back(std::make_shared<    SubCmdReset >(true,  false, false));
   }
 
   // Add depricated commands
   #ifdef ENABLE_DEPRECATED_2020_1_SUBCMDS
   {
     // Syntax: SubCmdClass( IsHidden, IsDepricated, IsPreliminary)
-    subCommands.emplace_back(std::make_shared<   SubCmdClock >(false, true, false));
-    subCommands.emplace_back(std::make_shared<      SubCmdDD >(false, true, false));
-    subCommands.emplace_back(std::make_shared<    SubCmdDump >(false, true, false));
-    subCommands.emplace_back(std::make_shared< SubCmdDmaTest >(false, true, false));
-    subCommands.emplace_back(std::make_shared<    SubCmdList >(false, true, false));
-    subCommands.emplace_back(std::make_shared< SubCmdM2MTest >(false, true, false));
-    subCommands.emplace_back(std::make_shared<     SubCmdMem >(false, true, false));
-    subCommands.emplace_back(std::make_shared<     SubCmdP2P >(false, true, false));
-    subCommands.emplace_back(std::make_shared<   SubCmdQuery >(false, true, false));
-    subCommands.emplace_back(std::make_shared<    SubCmdScan >(false, true, false));
-    subCommands.emplace_back(std::make_shared< SubCmdVersion >( true, true, false));
-    subCommands.emplace_back(std::make_shared<     SubCmdTop >(false, true, false));
+    subCommands.emplace_back(std::make_shared< SubCmdDmaTest >(true, true, false));
+    subCommands.emplace_back(std::make_shared<   SubCmdQuery >(true, true, false));
+    subCommands.emplace_back(std::make_shared<    SubCmdScan >(true, true, false));
   }
   #endif
 
-  // -- Determine and set the executable name for each subcommand
-  boost::filesystem::path pathAndFile(argv[0]);
-  const std::string executable = pathAndFile.stem().string();
+  const std::string executable = "xbutil";
 
   for (auto & subCommand : subCommands) {
     subCommand->setExecutableName(executable);
@@ -90,14 +70,14 @@ int main( int argc, char** argv )
   const std::string description = 
   "The Xilinx (R) Board Utility (xbutil) is a standalone command line utility that"
   " is included with the Xilinx Run Time (XRT) installation package. It includes"
-  " multiple commands to validate and identifythe installed card(s) along with"
+  " multiple commands to validate and identify the installed card(s) along with"
   " additional card details including DDR, PCIe (R), shell name (DSA), and system"
   " information.\n\nThis information can be used for both card administration and"
   " application debugging.";
 
   // -- Ready to execute the code
   try {
-    main_( argc, argv, description, subCommands);
+    main_( argc, argv, executable, description, subCommands);
     return 0;
   } catch (const std::exception &e) {
     xrt_core::send_exception_message(e.what(), executable.c_str());

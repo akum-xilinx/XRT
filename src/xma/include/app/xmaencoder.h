@@ -65,7 +65,8 @@ typedef enum XmaEncoderType
     XMA_VP9_ENCODER_TYPE, /**< 3 */
     XMA_AV1_ENCODER_TYPE, /**< 4 */
     XMA_COPY_ENCODER_TYPE, /**< 5 */
-    XMA_MULTI_ENCODER_TYPE, /**< 6 */
+    XMA_JPG_ENCODER_TYPE, /**< 6 */
+    XMA_MULTI_ENCODER_TYPE
 } XmaEncoderType;
 
 /**
@@ -117,6 +118,10 @@ typedef struct XmaEncoderProperties
     /** aq_mode  */
     int32_t         aq_mode;
     int32_t         minQP;
+    /** Rate Control Mode for Custom Rate Control **/
+    int32_t 	    rc_mode;
+    /** Look Ahead Depth  needed to count number of Custom RC Params **/
+    int32_t        la_depth;
     /** force property values to be accepted by encoder plugin */
     int32_t         force_param;
     /** array of kernel-specific custom initialization parameters */
@@ -129,6 +134,7 @@ typedef struct XmaEncoderProperties
     int32_t         ddr_bank_index;//Used for allocating device buffers. Used only if valid index is provide (>= 0); value of -1 imples that XMA should select automatically and then XMA will set it with bank index used automatically
     int32_t         channel_id;
     char            *plugin_lib;//Lib with full path
+    bool            ooo_execution;//Out of order execution of cu cmds
     int32_t         reserved[4];
 } XmaEncoderProperties;
 

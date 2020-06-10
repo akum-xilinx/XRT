@@ -19,7 +19,7 @@
 #include "xdp/profile/profile_config.h"
 #include "xdp/profile/collection/results.h"
 #include "xdp/profile/collection/counters.h"
-#include "xdp/profile/device/trace_parser.h"
+#include "xdp/profile/core/trace_parser.h"
 #include "xdp/profile/writer/base_profile.h"
 #include "xdp/profile/writer/base_trace.h"
 
@@ -481,11 +481,12 @@ namespace xdp {
       std::string cuPortName;
       std::string masterPortName;
       std::string slavePortName;
-      std::string masterArgNames = FIELD_NOT_APPLICABLE;
-      std::string slaveArgNames = FIELD_NOT_APPLICABLE;
       std::size_t cuFound = 0;
       std::size_t masterSlaveFound = 0;
       for (unsigned int s=0; s < numSlots; ++s) {
+        std::string masterArgNames = FIELD_NOT_APPLICABLE;
+        std::string slaveArgNames = FIELD_NOT_APPLICABLE;
+
         cuPortName = mDeviceBinaryStrSlotsMap.at(key)[s];
         masterSlaveFound = cuPortName.find(IP_LAYOUT_SEP);
         // Debug IP format : "MasterName-SlaveName"

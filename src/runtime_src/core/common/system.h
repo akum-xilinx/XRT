@@ -41,15 +41,15 @@ protected:
 public:
   // REMOVE
   virtual void
-  get_xrt_info(boost::property_tree::ptree &pt) = 0;
+  get_xrt_info(boost::property_tree::ptree&) {}
 
   // REMOVE
   virtual void
-  get_os_info(boost::property_tree::ptree &pt) = 0;
+  get_os_info(boost::property_tree::ptree&) {}
 
   // REMOVE
   virtual void
-  get_devices(boost::property_tree::ptree &pt) const = 0;
+  get_devices(boost::property_tree::ptree&) const {}
 
   /**
    */
@@ -57,16 +57,29 @@ public:
   get_total_devices(bool is_user = true) const = 0;
 
   /**
-   * get_userpf_device() - construct from device id
+   * get_userpf_device() - Open a new device specified by index
+   *
+   * This function calls xclOpen to create a new shim handle from
+   * which a core device is constructed.
+   *
+   * The returned device is managed, such that xclClose is called
+   * when device is no longer referenced.
    */
   virtual std::shared_ptr<device>
   get_userpf_device(device::id_type id) const = 0;
 
   /**
-   * get_userpf_device() - construct from existing handle and id
+   * get_userpf_device() - Get previous opened device from handle
    *
    * @hdl:  Handle for device
    * @id:   Device index
+   *
+   * The returned device is a pointer to the device opened previously
+   * by a call to xclOpen.  This call could be explicit xclOpen in
+   * host code, which must be followed by xclClose also in host code.
+   *
+   * The returned device is unmanaged, in other words xclClose is 
+   * not called when device goes out of scope.
    */
   virtual std::shared_ptr<device>
   get_userpf_device(device::handle_type hdl, device::id_type) const = 0;
@@ -77,7 +90,29 @@ public:
   virtual std::shared_ptr<device>
   get_mgmtpf_device(device::id_type id) const = 0;
 
+  /**
+   * get_monitor_access_type() - 
+   * 
+   * Each system have different ways of accessing profiling
+   * monitors (IPs in HW).  This function is used to determine
+   * the access type.   It may be better if accessing the monitor
+   * was part of the device class itself and thereby
+   * transparent to end user, but for now the type is provided
+   * here so that clients trigger off of the type.
+   */
+  enum class monitor_access_type { bar, mmap, ioctl };
+  virtual monitor_access_type
+  get_monitor_access_type() const
+  {
+    return monitor_access_type::bar;
+  }
 }; // system
+
+/**
+ */
+XRT_CORE_COMMON_EXPORT
+void
+get_xrt_build_info(boost::property_tree::ptree& pt);
 
 /**
  */
@@ -107,7 +142,11 @@ std::pair<uint64_t, uint64_t>
 get_total_devices(bool is_user);
 
 /**
- * get_userpf_device() - construct from device id
+ * get_userpf_device() - Open and create device specified by index
+ *
+ * This function calls xclOpen to create a new shim handle
+ * The returned device is managed, such that xclClose is called
+ * when device is deleted.
  */
 XRT_CORE_COMMON_EXPORT
 std::shared_ptr<device>
@@ -119,22 +158,28 @@ get_userpf_device(device::id_type id);
  * @hdl:  Handle for device.  The handle is from xclOpen().
  *
  * This is a cached lookup to allow retrieving device associated
- * with device handle obtained from xclOpen()
+ * with device handle obtained from xclOpen().
+ *
+ * The returned device is unmanaged, meaning that the underlying
+ * shim object is not closed when the device is deleted.
  */
 XRT_CORE_COMMON_EXPORT
 std::shared_ptr<device>
 get_userpf_device(device::handle_type handle);
 
 /**
- * get_userpf_device() - get userpf mdevice from existing handle and id
+ * get_userpf_device() - construct from existing handle and id
  *
  * @hdl:  Handle for device
  * @id:   Device index
  *
+ * The returned device is unmanaged, meaning that the underlying
+ * shim object is not closed when the device goes out of scope.
+ *
  * This is used by shim level implementations to construct and
  * cache a device object as part of constructing shim level handle.
  * The function is called from shim constructors (xclOpen()).  After
- * registration the xrt_core::device object can at all times be 
+ * registration, the xrt_core::device object can at all times be
  * retrived from just an hdl (xclDeviceHandle)
  */
 XRT_CORE_COMMON_EXPORT
@@ -143,10 +188,28 @@ get_userpf_device(device::handle_type device_handle, device::id_type id);
 
 /**
  * get_mgmtpf_device() - get mgmt device from device id
+ *
+ * This API is ambiguous in multi-threaded applications that
+ * open a device in each thread. In these cases only the device
+ * handle can be used to locate correspoding device object
  */
 XRT_CORE_COMMON_EXPORT
 std::shared_ptr<device>
 get_mgmtpf_device(device::id_type id);
+
+/**
+ * get_monitor_access_type() - How should IPs be accessed from userspace
+ * 
+ * Each system have different ways of accessing profiling
+ * monitors (IPs in HW).  This function is used to determine
+ * the access type.   It may be better if accessing the monitor
+ * was part of the device class itself and thereby
+ * transparent to end user, but for now the type is provided
+ * here so that clients trigger off of the type.
+ */
+XRT_CORE_COMMON_EXPORT
+system::monitor_access_type
+get_monitor_access_type();
 
 } //xrt_core
 

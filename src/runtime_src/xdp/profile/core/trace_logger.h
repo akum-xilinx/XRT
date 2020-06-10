@@ -21,7 +21,6 @@
 #include "xdp/profile/collection/counters.h"
 #include "xdp/profile/collection/results.h"
 #include "xdp/profile/plugin/base_plugin.h"
-#include "xdp/profile/device/trace_parser.h"
 
 #include "xclperf.h"
 
@@ -30,6 +29,7 @@
 #include <string>
 #include <mutex>
 #include <map>
+#include <set>
 #include <queue>
 
 namespace xdp {
@@ -39,6 +39,7 @@ namespace xdp {
   class KernelTrace;
   class BufferTrace;
   class DeviceTrace;
+  class TraceParser;
 
   // **************************************************************************
   // XDP trace logger class
@@ -123,11 +124,13 @@ namespace xdp {
     int mHostP2PTransfers;
     uint32_t mCurrentContextId;
     uint32_t mCuStarts;
-    uint32_t mCurrentTxCount = 0;
+    uint32_t mCurrentReadCount = 0;
+    uint32_t mCurrentWriteCount = 0;
     std::string mCurrentKernelName;
     std::string mCurrentDeviceName;
     std::string mCurrentBinaryName;
     std::mutex mLogMutex;
+    std::mutex mLogNext;
 
     std::map<uint64_t, KernelTrace*> mKernelTraceMap;
     std::map<uint64_t, BufferTrace*> mBufferTraceMap;

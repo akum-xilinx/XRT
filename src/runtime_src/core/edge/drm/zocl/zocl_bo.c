@@ -1,22 +1,17 @@
+/* SPDX-License-Identifier: GPL-2.0 OR Apache-2.0 */
 /*
  * A GEM style (optionally CMA backed) device manager for ZynQ based
  * OpenCL accelerators.
  *
- * Copyright (C) 2016-2019 Xilinx, Inc. All rights reserved.
+ * Copyright (C) 2016-2020 Xilinx, Inc. All rights reserved.
  *
  * Authors:
  *    Sonal Santan <sonal.santan@xilinx.com>
  *    Umang Parekh <umang.parekh@xilinx.com>
  *    Jan Stephan  <j.stephan@hzdr.de>
  *
- * This software is licensed under the terms of the GNU General Public
- * License version 2, as published by the Free Software Foundation, and
- * may be copied, distributed, and modified under those terms.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * This file is dual-licensed; you may select either the GNU General Public
+ * License version 2 or Apache License, Version 2.0.
  */
 
 #include <linux/pagemap.h>
@@ -37,7 +32,7 @@ void zocl_describe(const struct drm_zocl_bo *obj)
 	size_t size_in_kb = obj->cma_base.base.size / 1024;
 	size_t physical_addr = obj->cma_base.paddr;
 
-	DRM_DEBUG("%p: H[0x%zxKB] D[0x%zx]\n",
+	DRM_DEBUG("%px: H[0x%zxKB] D[0x%zx]\n",
 			obj,
 			size_in_kb,
 			physical_addr);
@@ -127,7 +122,7 @@ void zocl_free_userptr_bo(struct drm_gem_object *gem_obj)
 	/* Do all drm_gem_cma_free_object(bo->base) do, execpt free vaddr */
 	struct drm_zocl_bo *zocl_bo = to_zocl_bo(gem_obj);
 
-	DRM_INFO("%s: obj 0x%p", __func__, zocl_bo);
+	DRM_DEBUG("%s: obj 0x%px", __func__, zocl_bo);
 	if (zocl_bo->cma_base.sgt)
 		sg_free_table(zocl_bo->cma_base.sgt);
 
@@ -839,7 +834,7 @@ void zocl_free_host_bo(struct drm_gem_object *gem_obj)
 {
 	struct drm_zocl_bo *zocl_bo = to_zocl_bo(gem_obj);
 
-	DRM_INFO("%s: obj 0x%p", __func__, zocl_bo);
+	DRM_DEBUG("%s: obj 0x%px", __func__, zocl_bo);
 
 	memunmap(zocl_bo->cma_base.vaddr);
 
@@ -905,6 +900,9 @@ void zocl_init_mem(struct drm_zocl_dev *zdev, struct mem_topology *mtopo)
 {
 	struct zocl_mem *memp;
 	int i;
+
+	if (!mtopo)
+		return;
 
 	zdev->num_mem = mtopo->m_count;
 	zdev->mem = vzalloc(zdev->num_mem * sizeof(struct zocl_mem));

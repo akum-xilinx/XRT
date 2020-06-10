@@ -1,5 +1,5 @@
 /**
- * Copyright (C) 2016-2019 Xilinx, Inc
+ * Copyright (C) 2016-2020 Xilinx, Inc
  *
  * Licensed under the Apache License, Version 2.0 (the "License"). You may
  * not use this file except in compliance with the License. A copy of the
@@ -166,6 +166,20 @@ get_timeline_trace()
   return value;
 }
 
+inline bool
+get_continuous_trace()
+{
+  static bool value = get_profile() && detail::get_bool_value("Debug.continuous_trace",false);
+  return value;
+}
+
+inline unsigned int
+get_continuous_trace_interval_ms()
+{
+  static unsigned int value = detail::get_uint_value("Debug.continuous_trace_interval_ms",10);
+  return value;
+}
+
 inline std::string
 get_trace_buffer_size()
 {
@@ -181,16 +195,16 @@ get_profile_api()
 }
 
 inline bool
-get_hal_profile()
+get_xrt_profile()
 {
-  static bool value = detail::get_bool_value("Debug.hal_profile", false);
+  static bool value = detail::get_bool_value("Debug.xrt_profile", false);
   return value;
 }
 
 inline bool
-get_lop_profile()
+get_lop_trace()
 {
-  static bool value = detail::get_bool_value("Debug.lop_profile", false);
+  static bool value = detail::get_bool_value("Debug.lop_trace", false);
   return value;
 }
 
@@ -247,6 +261,27 @@ inline bool
 get_xclbin_programming()
 {
   return get_xclbin_programing();
+}
+
+/**
+ * Enable xma mode. 1 = default (1 cu cmd at a time); 2 = (upto 2 cu cmds at a time);  
+ *     3 = (upto 8 cu cmds at a time);  4 = (upto 64 cu cmds at a time); Max cu cmds at a time per session
+ */
+inline unsigned int
+get_xma_exec_mode()
+{
+  static unsigned int value = detail::get_uint_value("Runtime.xma_exec_mode",0x1);
+  return value;
+}
+
+/**
+ * Enable xma cpu mode. 1 = default (low cpu load + high perf); 2 = high perf; 3 = low cpu load
+ */
+inline unsigned int
+get_xma_cpu_mode()
+{
+  static unsigned int value = detail::get_uint_value("Runtime.xma_cpu_mode",0x1);
+  return value;
 }
 
 /**
@@ -317,7 +352,7 @@ get_ert_cqint()
 inline unsigned int
 get_ert_slotsize()
 {
-  static unsigned int value = detail::get_uint_value("Runtime.ert_slotsize",0x1000);
+  static unsigned int value = detail::get_uint_value("Runtime.ert_slotsize",0);
   return value;
 }
 
@@ -342,10 +377,15 @@ get_multiprocess()
   return value;
 }
 
+/**
+ * Set to true if host code uses post 2020.1 XRT BO APIs.
+ * This affects how the kernel APIs treat C-style variadic args for 
+ * global memory arguments.
+ */
 inline bool
-get_frequency_scaling()
+get_xrt_bo()
 {
-  static bool value = !get_multiprocess() && detail::get_bool_value("Runtime.frequency_scaling",true);
+  static bool value = detail::get_bool_value("Runtime.xrt_bo", false);
   return value;
 }
 
@@ -379,13 +419,6 @@ get_sw_em_driver()
   return value;
 }
 
-inline bool
-get_pdi_load()
-{
-  static bool value = detail::get_bool_value("Runtime.pdi_load",true);
-  return value;
-}
-
 /**
  * Indicate whether Block automation based Emulation Models are
  * used. By default, it is turned off.  This is used to turn on
@@ -397,6 +430,13 @@ inline bool
 get_system_dpa_emulation()
 {
   static bool value = detail::get_bool_value("Emulation.system_dpa", true);
+  return value;
+}
+
+inline std::string
+get_launch_waveform()
+{
+  static std::string value = detail::get_string_value("Emulation.launch_waveform","batch");
   return value;
 }
 
@@ -416,6 +456,36 @@ get_exclusive_cu_context()
   static bool value = detail::get_bool_value("Runtime.exclusive_cu_context", false);
   return value;
 }
+
+inline bool
+get_flag_kds_sw_emu()
+{
+  static bool value = detail::get_bool_value("Runtime.kds_sw_emu", false);
+  return value;
+}
+
+inline bool
+get_is_enable_prep_target()
+{
+  static bool value = detail::get_bool_value("Emulation.enable_prep_target", true);
+  return value;
+}
+
+inline bool
+get_is_enable_debug()
+{
+  static bool value = detail::get_bool_value("Emulation.enable_debug", false);
+  return value;
+}
+
+inline std::string
+get_aie_sim_options()
+{
+  static std::string value = detail::get_string_value("Emulation.aie_sim_options", "");
+  return value;
+}
+
+
 
 }} // config,xrt_core
 

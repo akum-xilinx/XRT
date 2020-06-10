@@ -19,7 +19,7 @@
 #define __XDP_BASE_TRACE_WRITER_H
 
 #include "xdp/profile/core/rt_util.h"
-#include "xdp/profile/device/trace_parser.h"
+#include "xdp/profile/core/trace_parser.h"
 #include "xdp/profile/plugin/base_plugin.h"
 
 #include <cstdlib>
@@ -72,7 +72,7 @@ namespace xdp {
 	    void writeDeviceCounters(xclPerfMonType type, xclCounterResults& results,
 		      double timestamp, uint32_t sampleNum, bool firstReadAfterProgram);
 	    // Write device trace
-	    void writeDeviceTrace(const TraceParser::TraceResultVector &resultVector,
+	    void writeDeviceTrace(const DeviceTrace &tr,
 	          std::string deviceName, std::string binaryName);
 
     protected:
@@ -80,7 +80,7 @@ namespace xdp {
       // stream it to a file
       // TODO: Windows doesn't support variadic functions till VS 2013.
       template<typename T>
-      void writeTableCells(std::ofstream& ofs, T value)
+      void writeTableCells(std::ofstream& ofs, const T& value)
       {
         ofs << cellStart();
         ofs << value;
@@ -88,7 +88,7 @@ namespace xdp {
       }
 
       template<typename T, typename... Args>
-      void writeTableCells(std::ofstream& ofs, T first, Args... args)
+      void writeTableCells(std::ofstream& ofs, const T& first, const Args& ... args)
       {
         writeTableCells(ofs, first);
         writeTableCells(ofs, args...);

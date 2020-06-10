@@ -19,9 +19,8 @@
 
 #include "xocl/config.h"
 #include "core/include/xclbin.h" // definition of binary structs
-
-#include "xclbin/binary.h"
-#include "xrt/util/uuid.h"
+#include "core/common/device.h"
+#include "core/common/uuid.h"
 
 #include <map>
 #include <string>
@@ -35,57 +34,19 @@ namespace xocl {
 class device;
 class kernel;
 
-/**
- * xocl::xclbin is a class that encapsulates the meta data of a binary
- * xclbin file (::xclbin::binary).  The binary file format must have
- * no meta data xml dependencies.
- *
- *   runtime/xocl/xclbin                runtime/xclbin
- *       xml-parsing                        binary
- *     [xocl::xclbin] <>------------ [ ::xclbin::binary ]
- *           ^                             ^       ^
- *           |                             |       |
- *          uses                          uses    uses
- *           |                             |       |
- *         [xocl]                        [xrt]    [hal]
- *
- */
 class xclbin
 {
-  struct impl;
-  std::shared_ptr<impl> m_impl;
-
-  impl*
-  impl_or_error() const;
-
 public:
   using addr_type = uint64_t;
   // Max 256 memory indicies for now. This number must be >= to number
   // of mem_topology.m_count.  Unfortunately it is a compile time constant.
   // A better solution must be found (boost::dynamic_bitset<>???)
-  using memidx_bitmask_type = std::bitset<256>;
   using memidx_type = int32_t;
   using connidx_type = int32_t;
+  static constexpr memidx_type max_banks = 256;
+  using memidx_bitmask_type = std::bitset<max_banks>;
 
   enum class target_type{ bin,x86,zynqps7,csim,cosim,hwem,invalid};
-
-  struct clocks
-  {
-    std::string region_name;
-    std::string clock_name;
-    unsigned int frequency;
-
-    clocks(std::string&& rn,std::string&& cn,unsigned int f)
-    : region_name(std::move(rn)), clock_name(std::move(cn)), frequency(f)
-    {}
-  };
-
-  struct profiler
-  {
-    using slot_type = std::tuple<int, std::string, std::string>; // index, cuname, type
-    std::vector<slot_type> slots;
-    std::string name;
-  };
 
   // A symbol captures all data required to construct an xocl::kernel
   // object.  It is associated with all kernel objects in the xclbin.
@@ -144,48 +105,32 @@ public:
   xclbin();
 
   /**
-   * The underlying binary type that represents the raw
-   * binary xclbin file per xclBin structs.
+   * xclbin() - construct xclbin meta data
    */
-  // implicit
-  xclbin(std::vector<char>&& xb);
-  xclbin(xclbin&& rhs);
-
-  xclbin(const xclbin& rhs);
-
-  XRT_XOCL_EXPORT
-  ~xclbin();
-
-  xclbin&
-  operator=(const xclbin&& rhs);
-
-  xclbin&
-  operator=(const xclbin& rhs);
+  xclbin(const xrt_core::device* core_device, const xrt_core::uuid& uuid);
 
   bool
-  operator==(const xclbin& rhs) const;
-
-  /**
-   * Access the raw binary xclbin
-   *
-   * The binary type API conforms to the xclBin struct interface
-   */
-  using binary_type = ::xclbin::binary;
-  XRT_XOCL_EXPORT
-  binary_type
-  binary() const;
+  operator==(const xclbin& rhs) const
+  {
+    return m_impl == rhs.m_impl;
+  }
+ 
+  operator bool() const
+  {
+    return m_impl != nullptr;
+  }
 
   /**
    * Get uuid of xclbin
    */
-  using uuid_type = xrt::uuid;
-  uuid_type
+  xrt_core::uuid
   uuid() const;
 
   /**
    * Access the project name per xml meta data
    */
-  XRT_XOCL_EXPORT std::string
+  XRT_XOCL_EXPORT
+  std::string
   project_name() const;
 
   /**
@@ -193,24 +138,6 @@ public:
    */
   target_type
   target() const;
-
-  /**
-   * Access the kernel clocks per OCL region
-   *
-   * This is meta data extraction
-   */
-  using kernel_clocks_type = std::vector<clocks>;
-  kernel_clocks_type
-  kernel_clocks();
-
-  /**
-   * Access the system clocks per OCL region
-   *
-   * This is meta data extraction
-   */
-  using system_clocks_type = std::vector<clocks>;
-  system_clocks_type
-  system_clocks();
 
   /**
    * Number of kernels
@@ -246,34 +173,10 @@ public:
   lookup_kernel(const std::string& name) const;
 
   /**
-   * Get the list of profilers
-   *
-   * @return
-   *  Vector of profiler struct objects constructed from the xclbin meta data.
-   */
-  using profilers_type = std::vector<profiler>;
-  profilers_type
-  profilers() const;
-
-  /**
-   * Get the clock frequency sections in xclbin
-   */
-  const clock_freq_topology*
-  get_clk_freq_topology() const;
-
-  /**
    * Get the mem topology section in xclbin
    */
   const mem_topology*
   get_mem_topology() const;
-
-  /**
-   * Get a sorted address map of all CUs in this xclbin
-   *
-   * The map is sorted in order of increasing base addresses.
-   */
-  std::vector<uint64_t>
-  cu_base_address_map() const;
 
   /**
    * Get memory connection indeces for CU argument at specified index
@@ -368,6 +271,14 @@ public:
 
   std::vector<std::string>
   conformance_kernel_hashes() const;
+
+private:
+  struct impl;
+  std::shared_ptr<impl> m_impl;
+
+  impl*
+  impl_or_error() const;
+
 };
 
 } // xocl

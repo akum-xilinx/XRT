@@ -16,6 +16,12 @@
 
 #include "config.h"
 #include "core/common/config_reader.h"
+#include <errno.h>
+#include <unistd.h>
+#include <string>
+#include <iostream>
+#include <sstream>
+#include <iomanip>
 
 namespace xclemulation{
 
@@ -50,9 +56,10 @@ namespace xclemulation{
     mUMRChecks = false;
     mOOBChecks = false;
     mMemLogs = false;
-    mLaunchWaveform = LAUNCHWAVEFORM::BATCH;
+    mLaunchWaveform = DEBUG_MODE::OFF;
     mDontRun = false;
     mSimDir = "";
+    mUserPreSimScript = "";
     mPacketSize = 0x800000;
     mMaxTraceCount = 1;
     mPaddingFactor = 1;
@@ -68,6 +75,9 @@ namespace xclemulation{
     mLauncherArgs = "";
     mSystemDPA = true;
     mLegacyErt = ERTMODE::NONE;
+    mCuBaseAddrForce=-1;
+    mIsSharedFmodel=true;
+    mTimeOutScale=TIMEOUT_SCALE::NA;
   }
 
   static bool getBoolValue(std::string& value,bool defaultValue)
@@ -138,18 +148,51 @@ namespace xclemulation{
       {
         setDontRun(getBoolValue(value,false));
       }
+      else if (name == "user_pre_sim_script") {
+        setUserPreSimScript(value);
+        setenv("USER_PRE_SIM_SCRIPT", value.c_str(), true);
+      }
+      else if (name == "user_post_sim_script") {
+        setUserPostSimScript(value);
+        setenv("USER_POST_SIM_SCRIPT", value.c_str(), true);
+      } 
+      else if (name == "xtlm_aximm_log") {
+        bool val = getBoolValue(value, true);
+        if (val) {
+          setenv("ENABLE_XTLM_AXIMM_LOG", "1", true);
+        } else {
+          setenv("ENABLE_XTLM_AXIMM_LOG", "0", true);
+        }
+      }
+      else if (name == "xtlm_axis_log") {
+        bool val = getBoolValue(value, true);
+        if (val) {
+          setenv("ENABLE_XTLM_AXIS_LOG", "1", true);
+        } else {
+          setenv("ENABLE_XTLM_AXIS_LOG", "0", true);
+        }
+      }
+      else if (name == "ENABLE_GMEM_LATENCY" || name == "enable_gmem_latency") {
+        //This is then new INI option that sets the ENV HW_EM_DISABLE_LATENCY to appropriate value before 
+        //launching simulation
+        bool val = getBoolValue(value, true);
+        if (val) {
+          setenv("HW_EM_DISABLE_LATENCY", "false", true);
+        } else {
+          setenv("HW_EM_DISABLE_LATENCY", "true", true);
+        }
+      }
       else if(name == "enable_shared_memory")
       {
-        //this is temporary solution to use legacy DDR model in emulation. We should remove this switch Once all issues in latest model is fixed
-        if(!getBoolValue(value,true))
-        {
-         setenv("SDX_USE_LEGACY_FMODEL","true",true);
-        }
+        mIsSharedFmodel=getBoolValue(value,true);
       }
       else if(name == "keep_run_dir")
       {
         setKeepRunDir(getBoolValue(value,false));
       }
+      else if (name == "enable_prep_target" || name == "enable_debug" || name == "aie_sim_options") {
+        //Do nothing: Added to bypass the WARNING that is issued below stating "invalid xrt.ini option" 
+      } 
       else if(name == "sim_dir")
       {
         setSimDir(value);
@@ -182,23 +225,30 @@ namespace xclemulation{
       {
         setLauncherArgs(value);
       }
-      else if(name == "launch_waveform")
+      else if(name == "launch_waveform" || name == "debug_mode" )
       {
+        if (name == "launch_waveform")
+          std::cout << "WARNING: [HW-EMU 09] INI option 'launch_waveform' is deprecated and replaced with the new switch 'debug_mode'." << std::endl;
+        
         if (boost::iequals(value,"gui" ))
         {
-          setLaunchWaveform(LAUNCHWAVEFORM::GUI);
+          setLaunchWaveform(DEBUG_MODE::GUI);
         }
         else if (boost::iequals(value,"batch" ))
         {
-          setLaunchWaveform(LAUNCHWAVEFORM::BATCH);
+          setLaunchWaveform(DEBUG_MODE::BATCH);
         }
         else if (boost::iequals(value,"off" ))
         {
-          setLaunchWaveform(LAUNCHWAVEFORM::OFF);
+          setLaunchWaveform(DEBUG_MODE::OFF);
+        }
+        else if (boost::iequals(value,"gdb" ))
+        {
+          setLaunchWaveform(DEBUG_MODE::GDB);
         }
         else
         {
-          setLaunchWaveform(LAUNCHWAVEFORM::BATCH);
+          setLaunchWaveform(DEBUG_MODE::OFF);
         }
       }
       else if(name == "Debug.sdx_server_port")
@@ -225,10 +275,22 @@ namespace xclemulation{
           setLegacyErt(ERTMODE::UPDATED);
         else if(boost::iequals(value,"true"))
           setLegacyErt(ERTMODE::LEGACY);
+      } else if (name=="cu_base_addr_force") {
+          mCuBaseAddrForce= strtoll(value.c_str(),NULL,0);
+      } else if (name == "timeout_scale") {
+      	  if (boost::iequals(value,"ms")) {
+      		mTimeOutScale=TIMEOUT_SCALE::MS;
+      	  } else if (boost::iequals(value,"sec")) {
+    		  mTimeOutScale=TIMEOUT_SCALE::SEC;
+    	  } else if (boost::iequals(value,"min")) {
+    		  mTimeOutScale=TIMEOUT_SCALE::MIN;
+    	  } else {
+    		  mTimeOutScale=TIMEOUT_SCALE::NA;
+    	  }
       }
       else if(name.find("Debug.") == std::string::npos)
       {
-        std::cout<<"WARNING: [HW-EM 08] Invalid option '"<<name<<"` specified in sdaccel.ini"<<std::endl;
+        std::cout<<"WARNING: [HW-EM 08] Invalid option '"<<name<<"` specified in xrt.ini"<<std::endl;
       }
     }
     //this code has to be removed once gui generates ini file by adding launch_waveform property
@@ -238,21 +300,22 @@ namespace xclemulation{
       std::string simulationMode = simMode;
       if (boost::iequals(simulationMode,"gui" ))
       {
-        setLaunchWaveform(LAUNCHWAVEFORM::GUI);
+        setLaunchWaveform(DEBUG_MODE::GUI);
       }
       else if (boost::iequals(simulationMode,"batch" ))
       {
-        setLaunchWaveform(LAUNCHWAVEFORM::BATCH);
+        setLaunchWaveform(DEBUG_MODE::BATCH);
       }
       else if (boost::iequals(simulationMode,"off" ))
       {
-        setLaunchWaveform(LAUNCHWAVEFORM::OFF);
+        setLaunchWaveform(DEBUG_MODE::OFF);
       }
-
+      else if (boost::iequals(simulationMode,"gdb" ))
+      {
+        setLaunchWaveform(DEBUG_MODE::GDB);
+      }
     }
-
   }
-
 
   static std::string getSelfPath()
   {
@@ -304,6 +367,19 @@ namespace xclemulation{
     if(xem)
     {
       if((std::strcmp(xem,"hw_emu") == 0) || (std::strcmp(xem,"sw_emu") == 0))
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool is_sw_emulation()
+  {    
+    static auto xem = std::getenv("XCL_EMULATION_MODE");
+    if (xem)
+    {
+      if (std::strcmp(xem, "sw_emu") == 0)
       {
         return true;
       }
@@ -808,4 +884,79 @@ namespace xclemulation{
     ifs.close();
     return false;
   }
+
+  std::string getXclbinVersion(const axlf* top)
+  {
+    std::string sVersion = "";
+    const axlf_section_header *xml_hdr = ::xclbin::get_axlf_section(top, BUILD_METADATA);
+
+    if (!xml_hdr) {
+      return sVersion;
+    }
+    auto begin = reinterpret_cast<const char*>(top) + xml_hdr->m_sectionOffset;
+    const char *json_data = reinterpret_cast<const char*>(begin);
+    uint64_t xml_size = xml_hdr->m_sectionSize;
+
+    boost::property_tree::ptree json_project;
+    std::stringstream json_stream;
+    json_stream.write(json_data, xml_size);
+    boost::property_tree::read_json(json_stream, json_project);
+    auto json_meta = json_project.get_child_optional("build_metadata");
+    if (!json_meta) {
+      return sVersion;
+    }
+    auto buildMetaData = json_project.get_child("build_metadata");
+    //std::string sTool = buildMetaData.get<std::string>("xclbin.generated_by.name", "");
+    sVersion = buildMetaData.get<std::string>("xclbin.generated_by.version", "");
+    //std::string sTimeStamp = buildMetaData.get<std::string>("xclbin.generated_by.time_stamp", "");    
+    //std::cout << __func__ <<" Tool : " << sTool << " Version : " << sVersion << " TimeStamp : " << sTimeStamp << std::endl;
+    return sVersion;
+  }
+
+  std::string getVivadoVersion()
+  {
+    char *xilinxVivadoEnvvar = getenv("XILINX_VIVADO");
+    std::string sVivadoDir = "";
+    if (xilinxVivadoEnvvar)
+    {
+      sVivadoDir = xilinxVivadoEnvvar;
+    }
+    std::string strVersionTmp = "";
+    for (int i = VIVADO_MIN_VERSION; i < VIVADO_MAX_VERSION; i++) {
+      float version = (float)i;
+      for (int j = 0; j < 4; j++) {
+        version = version + 0.1;
+        std::ostringstream streamObj;
+        // Set Fixed -Point Notation
+        streamObj << std::fixed;
+        // Set precision to 1 digit
+        streamObj << std::setprecision(1);
+        //Add double to stream
+        streamObj << version;
+        // Get string from output string stream
+        std::string strVersion = streamObj.str();
+        std::size_t found = sVivadoDir.find(strVersion);
+        if (found != std::string::npos) {
+          //std::cout << "Vivado Version : " << strVersion << std::endl;
+          return strVersion;
+        }
+      }
+    }
+    return strVersionTmp;
+  }
+
+  void checkXclibinVersionWithTool(const xclBin *header)
+  {   
+    auto top = reinterpret_cast<const axlf*>(header);
+    std::string xclbinVersion = xclemulation::getXclbinVersion(top);
+    std::string vivadoVersion = xclemulation::getVivadoVersion();   
+    if(!xclbinVersion.empty() && !vivadoVersion.empty()) {
+      std::size_t found = xclbinVersion.find(vivadoVersion);
+      if (found == std::string::npos) {        
+        std::string warnMsg = "WARNING: XCLBIN used is generated with Vivado version " + xclbinVersion + " where as it is run with the Vivado version " + vivadoVersion + " which is not compatible. May result to weird behaviour.";
+        std::cout << warnMsg << std::endl;
+      }
+    }
+  }
+
 }

@@ -14,18 +14,23 @@
  * under the License.
  */
 #define XRT_CORE_COMMON_SOURCE
-#include "core/common/system.h"
-#include "core/common/device.h"
+#include "system.h"
+#include "device.h"
+#include "gen/version.h"
 
 #include <vector>
 #include <map>
 #include <memory>
+#include <mutex>
 
 namespace {
 
 static std::vector<std::weak_ptr<xrt_core::device>> mgmtpf_devices(16); // fix size
 static std::vector<std::weak_ptr<xrt_core::device>> userpf_devices(16); // fix size
 static std::map<xrt_core::device::handle_type, std::weak_ptr<xrt_core::device>> userpf_device_map;
+
+// mutex to protect insertion
+static std::mutex mutex;
 
 }
 
@@ -34,7 +39,7 @@ namespace xrt_core {
 // Singleton is initialized when libxrt_core is loaded
 // A concrete system object is constructed during static
 // global initialization.  Lifetime is until core library
-// is unloaded. 
+// is unloaded.
 system* singleton = nullptr;
 
 system::
@@ -54,8 +59,18 @@ instance()
 }
 
 void
+get_xrt_build_info(boost::property_tree::ptree& pt)
+{
+  pt.put("version",    xrt_build_version);
+  pt.put("branch",     xrt_build_version_branch);
+  pt.put("hash",       xrt_build_version_hash);
+  pt.put("build_date", xrt_build_version_date);
+}
+
+void
 get_xrt_info(boost::property_tree::ptree &pt)
 {
+  get_xrt_build_info(pt);
   instance().get_xrt_info(pt);
 }
 
@@ -74,17 +89,26 @@ get_devices(boost::property_tree::ptree& pt)
 std::shared_ptr<device>
 get_userpf_device(device::id_type id)
 {
-  auto device = userpf_devices[id].lock();
-  if (!device) {
-    device = instance().get_userpf_device(id);
-    userpf_devices[id] = device;
-  }
-  return device;
+  // Construct device by calling xclOpen, the returned
+  // device is cached and unmanaged
+  auto device = instance().get_userpf_device(id);
+
+  if (!device)
+    throw std::runtime_error("Could not open device");
+
+  // Repackage raw ptr in new shared ptr with deleter that calls xclClose,
+  // but leaves device object alone. The returned device is managed in that
+  // it calls xclClose when going out of scope.
+  auto close = [] (xrt_core::device* d) { d->close_device(); };
+  return {device.get(), close};
 }
 
 std::shared_ptr<device>
 get_userpf_device(device::handle_type handle)
 {
+  // Look up core device from low level shim handle
+  // The handle is inserted into map as part of
+  // calling xclOpen
   auto itr = userpf_device_map.find(handle);
   if (itr != userpf_device_map.end())
     return (*itr).second.lock();
@@ -94,23 +118,24 @@ get_userpf_device(device::handle_type handle)
 std::shared_ptr<device>
 get_userpf_device(device::handle_type handle, device::id_type id)
 {
-  // check device map cache
+  // Check device map cache
   if (auto device = get_userpf_device(handle)) {
     if (device->get_device_id() != id)
         throw std::runtime_error("get_userpf_device: id mismatch");
     return device;
   }
 
+  // Construct a new device object and insert in map.
   auto device = instance().get_userpf_device(handle,id);
-  userpf_devices[id] = device;
-  userpf_device_map.insert(std::make_pair(handle, device));
+  std::lock_guard<std::mutex> lk(mutex);
+  userpf_device_map[handle] = device;  // create or replace
   return device;
 }
-  
+
 std::shared_ptr<device>
 get_mgmtpf_device(device::id_type id)
 {
-  // check cache
+  // Check cache
   auto device = mgmtpf_devices[id].lock();
   if (!device) {
     device = instance().get_mgmtpf_device(id);
@@ -123,6 +148,12 @@ std::pair<uint64_t, uint64_t>
 get_total_devices(bool is_user)
 {
   return instance().get_total_devices(is_user);
+}
+
+system::monitor_access_type
+get_monitor_access_type()
+{
+  return instance().get_monitor_access_type();
 }
 
 } // xrt_core

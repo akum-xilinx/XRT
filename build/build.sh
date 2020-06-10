@@ -2,13 +2,13 @@
 
 set -e
 
-OSDIST=`lsb_release -i |awk -F: '{print tolower($2)}' | tr -d ' \t'`
+OSDIST=`grep '^ID=' /etc/os-release | awk -F= '{print $2}' | tr -d '"'`
 BUILDDIR=$(readlink -f $(dirname ${BASH_SOURCE[0]}))
 CORE=`grep -c ^processor /proc/cpuinfo`
 CMAKE=cmake
 CPU=`uname -m`
 
-if [[ $OSDIST == "centos" ]] || [[ $OSDIST == "amazon" ]]; then
+if [[ $OSDIST == "centos" ]] || [[ $OSDIST == "amazon" ]] || [[ $OSDIST == "rhel" ]] || [[ $OSDIST == "fedora" ]]; then
     CMAKE=cmake3
     if [[ ! -x "$(command -v $CMAKE)" ]]; then
         echo "$CMAKE is not installed, please run xrtdeps.sh"
@@ -40,8 +40,10 @@ usage()
     echo "[-opt]                     Build optimized library only (default)"
     echo "[-edge]                    Build edge of x64.  Turns off opt and dbg"
     echo "[-nocmake]                 Skip CMake call"
+    echo "[-noctest]                 Skip unit tests"
     echo "[-j <n>]                   Compile parallel (default: system cores)"
     echo "[-ccache]                  Build using RDI's compile cache"
+    echo "[-toolchain <file>]        Extra toolchain file to configure CMake"
     echo "[-driver]                  Include building driver code"
     echo "[-checkpatch]              Run checkpatch.pl on driver code"
     echo "[-verbose]                 Turn on verbosity when compiling"
@@ -68,6 +70,7 @@ opt=1
 dbg=1
 edge=0
 nocmake=0
+noctest=0
 ertfw=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -103,6 +106,10 @@ while [ $# -gt 0 ]; do
             nocmake=1
             shift
             ;;
+        -noctest)
+            noctest=1
+            shift
+            ;;
         -j)
             shift
             jcore=$1
@@ -110,6 +117,11 @@ while [ $# -gt 0 ]; do
             ;;
         -ccache)
             ccache=1
+            shift
+            ;;
+        -toolchain)
+            shift
+            toolchain=$1
             shift
             ;;
         -checkpatch)
@@ -180,12 +192,14 @@ if [[ $dbg == 1 ]]; then
   mkdir -p $debug_dir
   cd $debug_dir
   if [[ $nocmake == 0 ]]; then
-    echo "$CMAKE -DRDI_CCACHE=$ccache -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON ../../src"
-    time $CMAKE -DRDI_CCACHE=$ccache -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON ../../src
+	echo "$CMAKE -DRDI_CCACHE=$ccache -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_TOOLCHAIN_FILE=$toolchain ../../src"
+	time $CMAKE -DRDI_CCACHE=$ccache -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_TOOLCHAIN_FILE=$toolchain ../../src
   fi
   echo "make -j $jcore $verbose DESTDIR=$PWD install"
   time make -j $jcore $verbose DESTDIR=$PWD install
-  time ctest --output-on-failure
+  if [[ $noctest == 0 ]]; then
+      time ctest --output-on-failure
+  fi
   cd $BUILDDIR
 fi
 
@@ -193,8 +207,8 @@ if [[ $opt == 1 ]]; then
   mkdir -p $release_dir
   cd $release_dir
   if [[ $nocmake == 0 ]]; then
-    echo "$CMAKE -DRDI_CCACHE=$ccache -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON ../../src"
-    time $CMAKE -DRDI_CCACHE=$ccache -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON ../../src
+	echo "$CMAKE -DRDI_CCACHE=$ccache -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_TOOLCHAIN_FILE=$toolchain ../../src"
+	time $CMAKE -DRDI_CCACHE=$ccache -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_TOOLCHAIN_FILE=$toolchain ../../src
   fi
 
   if [[ $docs == 1 ]]; then
@@ -203,15 +217,17 @@ if [[ $opt == 1 ]]; then
   else
     echo "make -j $jcore $verbose DESTDIR=$PWD install"
     time make -j $jcore $verbose DESTDIR=$PWD install
-    time ctest --output-on-failure
+    if [[ $noctest == 0 ]]; then
+        time ctest --output-on-failure
+    fi
     time make package
   fi
 
   if [[ $driver == 1 ]]; then
     unset CC
     unset CXX
-    echo "make -C usr/src/xrt-2.6.0/driver/xocl"
-    make -C usr/src/xrt-2.6.0/driver/xocl
+    echo "make -C usr/src/xrt-2.7.0/driver/xocl"
+    make -C usr/src/xrt-2.7.0/driver/xocl
     if [[ $CPU == "aarch64" ]]; then
 	# I know this is dirty as it messes up the source directory with build artifacts but this is the
 	# quickest way to enable native zocl build in Travis CI environment for aarch64
@@ -243,7 +259,7 @@ fi
 
 if [[ $checkpatch == 1 ]]; then
     # check only driver released files
-    DRIVERROOT=`readlink -f $BUILDDIR/$release_dir/usr/src/xrt-2.6.0/driver`
+    DRIVERROOT=`readlink -f $BUILDDIR/$release_dir/usr/src/xrt-2.7.0/driver`
 
     # find corresponding source under src tree so errors can be fixed in place
     XOCLROOT=`readlink -f $BUILDDIR/../src/runtime_src/core/pcie/driver`

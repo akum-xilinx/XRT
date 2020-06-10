@@ -1,17 +1,12 @@
+/* SPDX-License-Identifier: GPL-2.0 OR Apache-2.0 */
 /*
- * Copyright (C) 2016-2018 Xilinx, Inc. All rights reserved.
+ * Copyright (C) 2016-2020 Xilinx, Inc. All rights reserved.
  *
  * Author(s):
  *        Min Ma <min.ma@xilinx.com>
  *
- * This software is licensed under the terms of the GNU General Public
- * License version 2, as published by the Free Software Foundation, and
- * may be copied, distributed, and modified under those terms.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * This file is dual-licensed; you may select either the GNU General Public
+ * License version 2 or Apache License, Version 2.0.
  */
 #include "ert.h"
 #include "zocl_ert.h"
@@ -107,7 +102,7 @@ ert_mpsoc_next(struct zocl_ert_dev *ert, struct ert_packet *pkg, int *idx_ret)
 	} else {
 		/* ERT mode is only for 64 bits system */
 		slot_info = ((u64)pkg - (u64)ert->cq_ioremap);
-		do_div(slot_info,slot_sz);
+		do_div(slot_info, slot_sz);
 		slot_idx = slot_info;
 	}
 

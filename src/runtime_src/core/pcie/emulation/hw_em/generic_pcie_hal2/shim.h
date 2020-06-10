@@ -28,6 +28,7 @@
 #include "xcl_api_macros.h"
 #include "xcl_macros.h"
 #include "xclbin.h"
+#include "core/common/device.h"
 #include "core/common/scheduler.h"
 #include "core/common/message.h"
 #include "core/common/xrt_profiling.h"
@@ -153,7 +154,7 @@ using addr_type = uint64_t;
       uint64_t xclAllocDeviceBuffer2(size_t& size, xclMemoryDomains domain, unsigned flags,bool p2pBuffer, std::string &sFileName);
 
       void xclOpen(const char* logfileName);
-      void xclFreeDeviceBuffer(uint64_t buf);
+      void xclFreeDeviceBuffer(uint64_t buf,bool sendtosim);
       size_t xclCopyBufferHost2Device(uint64_t dest, const void *src, size_t size, size_t seek, uint32_t topology);
       size_t xclCopyBufferDevice2Host(void *dest, uint64_t src, size_t size, size_t skip, uint32_t topology);
       void xclClose();
@@ -184,6 +185,7 @@ using addr_type = uint64_t;
       bool get_simulator_started() {return simulator_started;}
       void fillDeviceInfo(xclDeviceInfo2* dest, xclDeviceInfo2* src);
       void saveWaveDataBase();
+      void extractEmuData(const std::string& simPath, int binaryCounter, bitStreamArg args);
 
       // Sanity checks
       static HwEmShim *handleCheck(void *handle);
@@ -205,6 +207,7 @@ using addr_type = uint64_t;
       static const unsigned CONTROL_AP_DONE;
       static const unsigned CONTROL_AP_IDLE;
       static const unsigned CONTROL_AP_CONTINUE;
+      static const unsigned REG_BUFF_SIZE;
 
       bool isUnified()               { return bUnified; }
       void setUnified(bool _unified) { bUnified = _unified; }
@@ -242,15 +245,21 @@ using addr_type = uint64_t;
 
       void fetchAndPrintMessages();
       std::mutex mPrintMessagesLock;
+      // Restricted read/write on IP register space
+      int xclRegWrite(uint32_t cu_index, uint32_t offset, uint32_t data);
+      int xclRegRead(uint32_t cu_index, uint32_t offset, uint32_t *datap);
 
     private:
-      //hw_em_profile* _profile_inst;
+      std::shared_ptr<xrt_core::device> mCoreDevice;
       bool simulator_started;
       uint64_t mRAMSize;
       size_t mCoalesceThreshold;
       void launchTempProcess() {};
 
       void initMemoryManager(std::list<xclemulation::DDRBank>& DDRBankList);
+      //Mapped CU register space for xclRegRead/Write()     
+      int xclRegRW(bool rd, uint32_t cu_index, uint32_t offset, uint32_t *datap);
+
       std::vector<xclemulation::MemoryManager *> mDDRMemoryManager;
       xclemulation::MemoryManager* mDataSpace;
       std::list<xclemulation::DDRBank> mDdrBanks;
@@ -321,18 +330,22 @@ using addr_type = uint64_t;
       uint8_t mAccelmonProperties[XAM_MAX_NUMBER_SLOTS];
       uint8_t mStreamMonProperties[XASM_MAX_NUMBER_SLOTS];
       std::vector<membank> mMembanks;
-      static std::map<int, std::tuple<std::string,int,void*> > mFdToFileNameMap;
+      static std::map<int, std::tuple<std::string,int,void*, unsigned int> > mFdToFileNameMap;
       std::list<std::tuple<uint64_t ,void*, std::map<uint64_t , uint64_t> > > mReqList;
       uint64_t mReqCounter;
       FeatureRomHeader mFeatureRom;
       std::set<unsigned int > mImportedBOs;
       uint64_t mCuBaseAddress;
-
+      bool     mVersalPlatform;
       //For Emulation specific messages on host from Device
       std::thread mMessengerThread;
       bool mMessengerThreadStarted;
       void closemMessengerThread();
       bool mIsTraceHubAvailable;
+      //CU register space for xclRegRead/Write()
+      std::map<uint32_t, uint64_t> mCuIndxVsBaseAddrMap;
+      uint32_t mCuIndx;
+      const size_t mCuMapSize = 64 * 1024;
   };
 
   extern std::map<unsigned int, HwEmShim*> devices;

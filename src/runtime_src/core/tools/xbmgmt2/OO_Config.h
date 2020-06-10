@@ -19,16 +19,28 @@
 
 #include "tools/common/OptionOptions.h"
 
+#include <vector>
+
 class OO_Config : public OptionOptions {
  public:
   virtual void execute( const SubCmdOptions &_options ) const;
 
  public:
-  OO_Config(const std::string &_longName);
+  OO_Config(const std::string &_longName, bool _isHidden = false);
 
  private:
-  std::string m_device;
+  std::vector<std::string> m_device;
   bool m_help;
+  bool m_daemon;
+  std::string m_host;
+  std::string m_security;
+  std::string m_clk_scale;
+  std::string m_power_override;
+  bool m_show;
+  bool m_ddr;
+  bool m_hbm;
+  bool m_enable_retention;
+  bool m_disable_retention;
 
 };
 

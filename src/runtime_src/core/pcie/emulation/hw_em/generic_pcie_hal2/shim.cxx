@@ -15,10 +15,12 @@
  */
 
 #include "shim.h"
+#include "system_hwemu.h"
 #include <string.h>
 #include <boost/property_tree/xml_parser.hpp>
 #include <errno.h>
 #include <unistd.h>
+#include <boost/lexical_cast.hpp>
 
 #include "xcl_perfmon_parameters.h"
 
@@ -38,7 +40,7 @@ namespace xclhwemhal2 {
   namespace pt = boost::property_tree;
   std::map<unsigned int, HwEmShim*> devices;
   std::map<std::string, std::string> HwEmShim::mEnvironmentNameValueMap(xclemulation::getEnvironmentByReadingIni());
-  std::map<int, std::tuple<std::string,int,void*> > HwEmShim::mFdToFileNameMap;
+  std::map<int, std::tuple<std::string,int,void*, unsigned int> > HwEmShim::mFdToFileNameMap;
   std::ofstream HwEmShim::mDebugLogStream;
   bool HwEmShim::mFirstBinary = true;
   unsigned int HwEmShim::mBufferCount = 0;
@@ -51,6 +53,7 @@ namespace xclhwemhal2 {
   const unsigned HwEmShim::CONTROL_AP_DONE  = 2;
   const unsigned HwEmShim::CONTROL_AP_IDLE  = 4;
   const unsigned HwEmShim::CONTROL_AP_CONTINUE  = 0x10;
+  const unsigned HwEmShim::REG_BUFF_SIZE = 0x4;
   void messagesThread(xclhwemhal2::HwEmShim* inst);
   Event::Event()
   {
@@ -176,6 +179,9 @@ namespace xclhwemhal2 {
       return -1;
     }
 
+    //check xclbin version with vivado tool version
+    xclemulation::checkXclibinVersionWithTool(header);
+
     auto top = reinterpret_cast<const axlf*>(header);
     if (auto sec = xclbin::get_axlf_section(top, EMBEDDED_METADATA)) {
       xmlFileSize = sec->m_sectionSize;
@@ -291,10 +297,13 @@ namespace xclhwemhal2 {
 
   int HwEmShim::xclLoadBitstreamWorker(bitStreamArg args)
   {
+    bool is_enable_debug = xrt_core::config::get_is_enable_debug();
+    std::string aie_sim_options = xrt_core::config::get_aie_sim_options();
+
     if (mLogStream.is_open()) {
       //    mLogStream << __func__ << ", " << std::this_thread::get_id() << ", " << args.m_zipFile << std::endl;
     }
-
+    mCuIndx = 0;
     //TBD the file read may slowdown things...whenever xclLoadBitStream hal API implementation changes, we also need to make changes.
     std::unique_ptr<char[]> fileName(new char[1024]);
 #ifndef _WINDOWS
@@ -317,6 +326,7 @@ namespace xclhwemhal2 {
     std::string binaryDirectory = ss.str();
 
     systemUtil::makeSystemCall(binaryDirectory, systemUtil::systemOperation::CREATE);
+    systemUtil::makeSystemCall(binaryDirectory, systemUtil::systemOperation::PERMISSIONS, "777");
 
     mRunDeviceBinDir = binaryDirectory;
 
@@ -369,23 +379,6 @@ namespace xclhwemhal2 {
       fclose(fp2);
     }
 
-    std::unique_ptr<char[]> emuDataFileName(new char[1024]);
-#ifndef _WINDOWS
-    // TODO: Windows build support
-    // getpid is defined in unistd.h
-    std::sprintf(emuDataFileName.get(), "%s/emuDataFile_%d", binaryDirectory.c_str(), binaryCounter);
-#endif
-
-    if ((args.m_emuData != nullptr) && (args.m_emuDataSize > 1))
-    {
-      std::ofstream os(emuDataFileName.get());
-      os.write(args.m_emuData, args.m_emuDataSize);
-      os.close();
-
-      std::string emuDataFilePath(emuDataFileName.get());
-      systemUtil::makeSystemCall(emuDataFilePath, systemUtil::systemOperation::UNZIP, binaryDirectory);
-    }
-
     readDebugIpLayout(debugFileName);
 
     const mem_topology* m_mem = (reinterpret_cast<const ::mem_topology*>(args.m_memTopology));
@@ -429,19 +422,36 @@ namespace xclhwemhal2 {
         //Give error and return from here
       }
     }
-
+    
+    std::string fpgaDevice="";
+    
     // iterate devices
     count = 0;
     for (auto& xml_device : xml_project.get_child("project.platform"))
     {
       if (xml_device.first != "device")
         continue;
+      
+      fpgaDevice = xml_device.second.get<std::string>("<xmlattr>.fpgaDevice");
+      
       if (++count > 1)
       {
         //Give error and return from here
       }
     }
-
+    
+    //New DRC check for Versal Platforms
+    if (fpgaDevice != "" && fpgaDevice.find("versal:") != std::string::npos) {
+      mVersalPlatform=true;
+      if ((args.m_emuData == nullptr) && (args.m_emuDataSize <= 0)) {
+        std::string dMsg = "ERROR: [HW-EMU 09] EMULATION_DATA section in XCLBIN is missing. This is mandatory section required for Versal platforms";
+        logMessage(dMsg, 0);
+        return -1;
+      }
+    }
+    if (xclemulation::config::getInstance()->isSharedFmodel() && !mVersalPlatform) {
+      setenv("SDX_USE_SHARED_MEMORY","true",true); 
+    }
     // iterate cores
     count = 0;
     for (auto& xml_core : xml_project.get_child("project.platform.device"))
@@ -488,6 +498,15 @@ namespace xclhwemhal2 {
               continue;
             uint64_t base = convert(xml_remap.second.get<std::string>("<xmlattr>.base"));
             mCuBaseAddress = base & 0xFFFFFFFF00000000;
+            mCuIndxVsBaseAddrMap[mCuIndx++] = base;
+
+            std::string vbnv  = mDeviceInfo.mName;
+            //BAD Worharound for vck5000 need to remove once SIM_QDMA supports PCIE bar 
+            if(xclemulation::config::getInstance()->getCuBaseAddrForce()!=-1) {
+              mCuBaseAddress = xclemulation::config::getInstance()->getCuBaseAddrForce();
+            } else if(mVersalPlatform) {
+              mCuBaseAddress = 0x20200000000;
+            }
             mKernelOffsetArgsInfoMap[base] = kernelArgInfo;
             if (xclemulation::config::getInstance()->isMemLogsEnabled())
             {
@@ -513,16 +532,20 @@ namespace xclhwemhal2 {
     bool simDontRun = xclemulation::config::getInstance()->isDontRun();
     std::string launcherArgs = xclemulation::config::getInstance()->getLauncherArgs();
     std::string wdbFileName("");
+    std::string kernelProfileFileName("profile_kernels.csv");
+    std::string kernelTraceFileName("timeline_kernels.csv");
     // The following is evil--hardcoding. This name may change.
     // Is there a way we can determine the name from the directories or otherwise?
     std::string bdName("dr"); // Used to be opencldesign. This is new default.
 
     unsetenv("VITIS_WAVEFORM_WDB_FILENAME");
+    unsetenv("VITIS_KERNEL_PROFILE_FILENAME");
+    unsetenv("VITIS_KERNEL_TRACE_FILENAME");
 
     if (!simDontRun)
     {
       wdbFileName = std::string(mDeviceInfo.mName) + "-" + std::to_string(mDeviceIndex) + "-" + xclBinName;
-      xclemulation::LAUNCHWAVEFORM lWaveform = xclemulation::config::getInstance()->getLaunchWaveform();
+      xclemulation::DEBUG_MODE lWaveform = xclemulation::config::getInstance()->getLaunchWaveform();
       std::string userSpecifiedSimPath = xclemulation::config::getInstance()->getSimDir();
       if (userSpecifiedSimPath.empty())
       {
@@ -531,37 +554,85 @@ namespace xclhwemhal2 {
         systemUtil::makeSystemCall(binaryDirectory, systemUtil::systemOperation::PERMISSIONS, "777");
       }
 
-      if (lWaveform == xclemulation::LAUNCHWAVEFORM::GUI)
+      if (lWaveform == xclemulation::DEBUG_MODE::GUI)
       {
         // NOTE: proto inst filename must match name in HPIKernelCompilerHwEmu.cpp
         std::string protoFileName = "./" + bdName + "_behav.protoinst";
         std::stringstream cmdLineOption;
-        cmdLineOption << " -g --wdb " << wdbFileName << ".wdb"
-          << " --protoinst " << protoFileName;
-
-        launcherArgs = launcherArgs + cmdLineOption.str();
+        std::string waveformDebugfilePath = "";
         sim_path = binaryDirectory + "/behav_waveform/xsim";
+
+        if (boost::filesystem::exists(sim_path) != false) {
+          waveformDebugfilePath = sim_path + "/waveform_debug_enable.txt";
+          cmdLineOption << " -g --wdb " << wdbFileName << ".wdb"
+            << " --protoinst " << protoFileName;
+          launcherArgs = launcherArgs + cmdLineOption.str();
+        }
+        
         std::string generatedWcfgFileName = sim_path + "/" + bdName + "_behav.wcfg";
         unsetenv("VITIS_LAUNCH_WAVEFORM_BATCH");
-        setenv("VITIS_WAVEFORM", generatedWcfgFileName.c_str(), true);
-        setenv("VITIS_WAVEFORM_WDB_FILENAME", std::string(wdbFileName + ".wdb").c_str(), true);
+        if (waveformDebugfilePath != "" && boost::filesystem::exists(waveformDebugfilePath) != false) {
+          setenv("VITIS_WAVEFORM", generatedWcfgFileName.c_str(), true);
+          setenv("VITIS_WAVEFORM_WDB_FILENAME", std::string(wdbFileName + ".wdb").c_str(), true);
+        } else {
+          std::string dMsg = "WARNING: [HW-EMU 08-1] None of the Kernels compiled in the waveform enabled mode to get the WDB file. Do run V++ link with the -g option";
+          logMessage(dMsg, 0);
+        }
+        setenv("VITIS_KERNEL_PROFILE_FILENAME", kernelProfileFileName.c_str(), true);
+        setenv("VITIS_KERNEL_TRACE_FILENAME", kernelTraceFileName.c_str(), true);
       }
 
-      if (lWaveform == xclemulation::LAUNCHWAVEFORM::BATCH)
+      if (lWaveform == xclemulation::DEBUG_MODE::BATCH)
       {
         // NOTE: proto inst filename must match name in HPIKernelCompilerHwEmu.cpp
         std::string protoFileName = "./" + bdName + "_behav.protoinst";
         std::stringstream cmdLineOption;
+
         cmdLineOption << " --wdb " << wdbFileName << ".wdb"
           << " --protoinst " << protoFileName;
 
         launcherArgs = launcherArgs + cmdLineOption.str();
         sim_path = binaryDirectory + "/behav_waveform/xsim";
+        std::string waveformDebugfilePath = sim_path + "/waveform_debug_enable.txt";
+        
         std::string generatedWcfgFileName = sim_path + "/" + bdName + "_behav.wcfg";
         setenv("VITIS_LAUNCH_WAVEFORM_BATCH", "1", true);
-        setenv("VITIS_WAVEFORM", generatedWcfgFileName.c_str(), true);
-        setenv("VITIS_WAVEFORM_WDB_FILENAME", std::string(wdbFileName + ".wdb").c_str(), true);
+        if (boost::filesystem::exists(waveformDebugfilePath) != false) {          
+          setenv("VITIS_WAVEFORM", generatedWcfgFileName.c_str(), true);
+          setenv("VITIS_WAVEFORM_WDB_FILENAME", std::string(wdbFileName + ".wdb").c_str(), true);
+        } else {
+          std::string dMsg = "WARNING: [HW-EMU 08-2] None of the Kernels compiled in the waveform enabled mode to get the WDB file. Do run v++ link with the -g option";
+          logMessage(dMsg, 0);
+        }
+        setenv("VITIS_KERNEL_PROFILE_FILENAME", kernelProfileFileName.c_str(), true);
+        setenv("VITIS_KERNEL_TRACE_FILENAME", kernelTraceFileName.c_str(), true);
       }
+      
+      if (lWaveform == xclemulation::DEBUG_MODE::OFF) {
+        // NOTE: proto inst filename must match name in HPIKernelCompilerHwEmu.cpp
+        std::string protoFileName = "./" + bdName + "_behav.protoinst";
+        std::stringstream cmdLineOption;
+
+        cmdLineOption << " --wdb " << wdbFileName << ".wdb"
+          << " --protoinst " << protoFileName;
+
+        launcherArgs = launcherArgs + cmdLineOption.str();
+        sim_path = binaryDirectory + "/behav_waveform/xsim";
+        std::string waveformDebugfilePath = sim_path + "/waveform_debug_enable.txt";
+        
+        std::string generatedWcfgFileName = sim_path + "/" + bdName + "_behav.wcfg";
+        setenv("VITIS_LAUNCH_WAVEFORM_BATCH", "1", true);
+        if (boost::filesystem::exists(waveformDebugfilePath) != false) {
+          setenv("VITIS_WAVEFORM", generatedWcfgFileName.c_str(), true);
+          setenv("VITIS_WAVEFORM_WDB_FILENAME", std::string(wdbFileName + ".wdb").c_str(), true);
+        } 
+        
+        setenv("VITIS_KERNEL_PROFILE_FILENAME", kernelProfileFileName.c_str(), true);
+        setenv("VITIS_KERNEL_TRACE_FILENAME", kernelTraceFileName.c_str(), true);
+      }
+      
+      if (lWaveform == xclemulation::DEBUG_MODE::GDB) 
+        sim_path = binaryDirectory + "/behav_gdb/xsim";
 
       if (userSpecifiedSimPath.empty() == false)
       {
@@ -573,13 +644,47 @@ namespace xclhwemhal2 {
         {
           sim_path = binaryDirectory + "/behav_gdb/xsim";
         }
+        
         if (boost::filesystem::exists(sim_path) == false)
         {
-          std::string dMsg = "WARNING: [HW-EM 07] None of the kernels is compiled in debug mode. Compile kernels in debug mode to launch waveform";
-          logMessage(dMsg, 0);
-          sim_path = binaryDirectory + "/behav_gdb/xsim";
+          if (lWaveform == xclemulation::DEBUG_MODE::GDB) {
+            sim_path = binaryDirectory + "/behav_waveform/xsim";
+            std::string waveformDebugfilePath = sim_path + "/waveform_debug_enable.txt";
+            
+            std::string dMsg = "WARNING: [HW-EMU 07] debug_mode is set to 'gdb' in INI file and none of kernels compiled in GDB mode. Running simulation using waveform mode. Do run v++ link with -g and --xp param:hw_emu.debugMode=gdb options to launch simulation in 'gdb' mode";
+            logMessage(dMsg, 0);
+            
+            std::string protoFileName = "./" + bdName + "_behav.protoinst";
+            std::stringstream cmdLineOption;
+            cmdLineOption << " --wdb " << wdbFileName << ".wdb"
+              << " --protoinst " << protoFileName;
+
+            launcherArgs = launcherArgs + cmdLineOption.str();
+            std::string generatedWcfgFileName = sim_path + "/" + bdName + "_behav.wcfg";
+            setenv("VITIS_LAUNCH_WAVEFORM_BATCH", "1", true);
+            if (boost::filesystem::exists(waveformDebugfilePath) != false) {
+              setenv("VITIS_WAVEFORM", generatedWcfgFileName.c_str(), true);
+              setenv("VITIS_WAVEFORM_WDB_FILENAME", std::string(wdbFileName + ".wdb").c_str(), true);
+            } 
+
+            setenv("VITIS_KERNEL_PROFILE_FILENAME", kernelProfileFileName.c_str(), true);
+            setenv("VITIS_KERNEL_TRACE_FILENAME", kernelTraceFileName.c_str(), true);
+          }
+          else {
+            std::string dMsg;
+            sim_path = binaryDirectory + "/behav_gdb/xsim";
+            if (lWaveform == xclemulation::DEBUG_MODE::GUI) 
+              dMsg = "WARNING: [HW-EM 07] debug_mode is set to 'gui' in ini file. Cannot enable simulator gui in this mode. Using " + sim_path + " as simulation directory.";
+            else if (lWaveform == xclemulation::DEBUG_MODE::BATCH) 
+              dMsg = "WARNING: [HW-EM 07] debug_mode is set to 'batch' in ini file. Using " + sim_path + " as simulation directory.";
+            else 
+              dMsg = "WARNING: [HW-EM 07] debug_mode is set to 'off' in ini file (or) considered by default. Using " + sim_path + " as simulation directory.";
+            
+            logMessage(dMsg, 0);
+          }
         }
       }
+	  
       std::stringstream socket_id;
       socket_id << deviceName << "_" << binaryCounter << "_";
 #ifndef _WINDOWS
@@ -594,7 +699,6 @@ namespace xclhwemhal2 {
     if (deviceDirectory.empty() == false)
       setenv("EMULATION_RUN_DIR", deviceDirectory.c_str(), true);
 
-
     // Create waveform config file
     // NOTE: see corresponding wdb file in saveWaveDataBase
     if (wdbFileName.empty() == false)
@@ -603,8 +707,8 @@ namespace xclhwemhal2 {
       mBinaryDirectories[sim_path] = wdbFileName;
     }
 
-    //launch simulation
-    if (!sim_path.empty()) {
+    //launch simulation    
+    if (boost::filesystem::exists(sim_path) == true) {
 #ifndef _WINDOWS
       // TODO: Windows build support
       //   pid_t, fork, chdir, execl is defined in unistd.h
@@ -612,7 +716,8 @@ namespace xclhwemhal2 {
       setenv("SYSTEMC_DISABLE_COPYRIGHT_MESSAGE", "1", true);
       pid_t pid = fork();
       assert(pid >= 0);
-      if (pid == 0){ //I am child
+      if (pid == 0) { //I am child
+      
         //Redirecting the XSIM log to a file
         FILE* nP = freopen("/dev/null", "w", stdout);
         if (!nP) { std::cerr << "FATAR ERROR : Unable to redirect simulation output " << std::endl; exit(1); }
@@ -634,13 +739,45 @@ namespace xclhwemhal2 {
 
         const char* simMode = NULL;
         if (args.m_emuData) {
-          //So far assuming that we will have only one AIE Kernel, need to 
+          //Assuming that we will have only one AIE Kernel, need to 
           //update this logic when we have suport for multiple AIE Kernels
-          launcherArgs += " -emuData " + binaryDirectory + "/" + kernels.at(0) + "/aieshim_solution.aiesol";
-          launcherArgs += " -emu-data " + binaryDirectory + "/" + kernels.at(0) + "/aieshim_solution.aiesol";
-          launcherArgs += " -bootBH " + binaryDirectory + "/" + kernels.at(0) + "/boot_bh.bin";
-          launcherArgs += " -boot-bh " + binaryDirectory + "/" + kernels.at(0) + "/boot_bh.bin";
-          launcherArgs += " -image " + binaryDirectory + "/" + kernels.at(0) + "/qemu_qspi.bin";
+          
+          extractEmuData(sim_path, binaryCounter, args);
+          
+          launcherArgs += " -emuData " + sim_path + "/emulation_data/libsdf/cfg/aie.sim.config.txt";
+          launcherArgs += " -aie-sim-config " + sim_path + "/emulation_data/libsdf/cfg/aie.sim.config.txt";
+          launcherArgs += " -boot-bh " + sim_path + "/emulation_data/BOOT_bh.bin";
+          launcherArgs += " -ospi-image " + sim_path + "/emulation_data/qemu_ospi.bin";
+          launcherArgs += " -qemu-args-file " + sim_path + "/emulation_data/qemu_args.txt";
+
+          if (boost::filesystem::exists(sim_path + "/emulation_data/pmc_args.txt")) {
+            launcherArgs += " -pmc-args-file " + sim_path + "/emulation_data/pmc_args.txt";
+          }
+          else if (boost::filesystem::exists(sim_path + "/emulation_data/pmu_args.txt")) {
+            launcherArgs += " -pmc-args-file " + sim_path + "/emulation_data/pmu_args.txt";
+          }
+          else {
+            std::cout << "ERROR: [HW-EMU] Unable to find either PMU/PMC args which are required to launch the emulation." << std::endl;
+          }
+
+          if (is_enable_debug) {
+            launcherArgs += " -enable-debug ";
+          }
+
+          if (aie_sim_options != "") {
+            launcherArgs += " -aie-sim-options " + aie_sim_options;
+          }
+          
+          std::string userSpecifiedPreSimScript = xclemulation::config::getInstance()->getUserPreSimScript();
+          std::string userSpecifiedPostSimScript = xclemulation::config::getInstance()->getUserPostSimScript();
+
+          if (userSpecifiedPreSimScript != "") {
+            launcherArgs += " -user-pre-sim-script " + userSpecifiedPreSimScript;
+          }
+
+          if (userSpecifiedPostSimScript != "") {
+            launcherArgs += " -user-post-sim-script " + userSpecifiedPostSimScript;
+          }
         }
 
         if (!launcherArgs.empty())
@@ -648,6 +785,7 @@ namespace xclhwemhal2 {
 
         if (!file_exists(sim_file))
           sim_file = "simulate.sh";
+        
         int r = execl(sim_file.c_str(), sim_file.c_str(), simMode, NULL);
         fclose(stdout);
         if (r == -1){ std::cerr << "FATAL ERROR : Simulation process did not launch" << std::endl; exit(1); }
@@ -673,6 +811,27 @@ namespace xclhwemhal2 {
     }
 
     return 0;
+  }
+  
+  void HwEmShim::extractEmuData(const std::string& simPath, int binaryCounter, bitStreamArg args) {
+
+    std::unique_ptr<char[]> emuDataFileName(new char[1024]);
+#ifndef _WINDOWS
+    // TODO: Windows build support
+    // getpid is defined in unistd.h
+    std::sprintf(emuDataFileName.get(), "%s/emuDataFile_%d", mRunDeviceBinDir.c_str(), binaryCounter);
+#endif
+
+    if ((args.m_emuData != nullptr) && (args.m_emuDataSize > 1))
+    {
+      std::ofstream os(emuDataFileName.get());
+      os.write(args.m_emuData, args.m_emuDataSize);
+      os.close();
+
+      std::string emuDataFilePath(emuDataFileName.get());
+      systemUtil::makeSystemCall(emuDataFilePath, systemUtil::systemOperation::UNZIP, simPath);
+      systemUtil::makeSystemCall(mRunDeviceBinDir, systemUtil::systemOperation::PERMISSIONS, "777");
+    }
   }
 
    size_t HwEmShim::xclWrite(xclAddressSpace space, uint64_t offset, const void *hostBuf, size_t size) {
@@ -931,9 +1090,9 @@ uint32_t HwEmShim::getAddressSpace (uint32_t topology)
     logMessage(dMsg,1);
     void *handle = this;
 
-    unsigned int messageSize = xclemulation::config::getInstance()->getPacketSize();
-    unsigned int c_size = messageSize;
-    unsigned int processed_bytes = 0;
+    uint64_t messageSize = xclemulation::config::getInstance()->getPacketSize();
+    uint64_t c_size = messageSize;
+    uint64_t processed_bytes = 0;
     while(processed_bytes < size){
       if((size - processed_bytes) < messageSize){
         c_size = size - processed_bytes;
@@ -979,9 +1138,9 @@ uint32_t HwEmShim::getAddressSpace (uint32_t topology)
     logMessage(dMsg,1);
     void *handle = this;
 
-    unsigned int messageSize = xclemulation::config::getInstance()->getPacketSize();
-    unsigned int c_size = messageSize;
-    unsigned int processed_bytes = 0;
+    uint64_t messageSize = xclemulation::config::getInstance()->getPacketSize();
+    uint64_t c_size = messageSize;
+    uint64_t processed_bytes = 0;
 
     while(processed_bytes < size){
       if((size - processed_bytes) < messageSize){
@@ -1082,17 +1241,31 @@ uint32_t HwEmShim::getAddressSpace (uint32_t topology)
   }
 
 
-  void HwEmShim::xclFreeDeviceBuffer(uint64_t buf)
+  void HwEmShim::xclFreeDeviceBuffer(uint64_t offset, bool sendtoxsim)
   {
     if (mLogStream.is_open()) {
-      mLogStream << __func__ << ", " << std::this_thread::get_id() << ", " << buf << std::endl;
+      mLogStream << __func__ << ", " << std::this_thread::get_id() << ", " << offset << std::endl;
     }
 
     for (auto i : mDDRMemoryManager) {
-      if (buf < i->start() + i->size()) {
-        i->free(buf);
+      if (offset < i->start() + i->size()) {
+        i->free(offset);
       }
     }
+    bool ack = true;
+    if(sock)
+    {
+      //Currently Versal platforms does not support buffer deallocation
+      if(!mVersalPlatform && sendtoxsim) {
+        xclFreeDeviceBuffer_RPC_CALL(xclFreeDeviceBuffer,offset);
+      }
+    }
+    if(!ack)
+    {
+      PRINTENDFUNC;
+      return;
+    }
+
     PRINTENDFUNC;
   }
   void HwEmShim::logMessage(std::string& msg , int verbosity)
@@ -1199,6 +1372,11 @@ uint32_t HwEmShim::getAddressSpace (uint32_t topology)
     }
     mFdToFileNameMap.clear();
 
+    // Shim object is not deleted as part of closing device.
+    // The core device must correspond to open and close, so
+    // reset here rather than in destructor
+    mCoreDevice.reset();
+
     if (!sock) 
     {
       if( xclemulation::config::getInstance()->isKeepRunDirEnabled() == false)
@@ -1218,8 +1396,9 @@ uint32_t HwEmShim::getAddressSpace (uint32_t topology)
     resetProgram(false);
 
     int status = 0;
-    xclemulation::LAUNCHWAVEFORM lWaveform = xclemulation::config::getInstance()->getLaunchWaveform();
-    if(( lWaveform == xclemulation::LAUNCHWAVEFORM::GUI || lWaveform == xclemulation::LAUNCHWAVEFORM::BATCH) && xclemulation::config::getInstance()->isInfoSuppressed() == false)
+    xclemulation::DEBUG_MODE lWaveform = xclemulation::config::getInstance()->getLaunchWaveform();
+    if(( lWaveform == xclemulation::DEBUG_MODE::GUI || lWaveform == xclemulation::DEBUG_MODE::BATCH || lWaveform == xclemulation::DEBUG_MODE::OFF)
+      && xclemulation::config::getInstance()->isInfoSuppressed() == false)
     {
       std::string waitingMsg ="INFO: [HW-EM 06-0] Waiting for the simulator process to exit";
       logMessage(waitingMsg);
@@ -1229,7 +1408,8 @@ uint32_t HwEmShim::getAddressSpace (uint32_t topology)
     if(!simDontRun)
       while (-1 == waitpid(0, &status, 0));
 
-    if(( lWaveform == xclemulation::LAUNCHWAVEFORM::GUI || lWaveform == xclemulation::LAUNCHWAVEFORM::BATCH) && xclemulation::config::getInstance()->isInfoSuppressed() == false)
+    if(( lWaveform == xclemulation::DEBUG_MODE::GUI || lWaveform == xclemulation::DEBUG_MODE::BATCH || lWaveform == xclemulation::DEBUG_MODE::OFF)
+      && xclemulation::config::getInstance()->isInfoSuppressed() == false)
     {
       std::string waitingMsg ="INFO: [HW-EM 06-1] All the simulator processes exited successfully";
       logMessage(waitingMsg);
@@ -1248,7 +1428,7 @@ uint32_t HwEmShim::getAddressSpace (uint32_t topology)
       mLogStream << __func__ << ", " << std::this_thread::get_id() << std::endl;
     }
     
-     for (auto& it: mFdToFileNameMap)
+    for (auto& it: mFdToFileNameMap)
     {
       int fd=it.first;
       int sSize = std::get<1>(it.second);
@@ -1337,8 +1517,9 @@ uint32_t HwEmShim::getAddressSpace (uint32_t topology)
     if(saveWdb)
     {
       int status = 0;
-      xclemulation::LAUNCHWAVEFORM lWaveform = xclemulation::config::getInstance()->getLaunchWaveform();
-      if(( lWaveform == xclemulation::LAUNCHWAVEFORM::GUI || lWaveform == xclemulation::LAUNCHWAVEFORM::BATCH) && xclemulation::config::getInstance()->isInfoSuppressed() == false)
+      xclemulation::DEBUG_MODE lWaveform = xclemulation::config::getInstance()->getLaunchWaveform();
+      if(( lWaveform == xclemulation::DEBUG_MODE::GUI || lWaveform == xclemulation::DEBUG_MODE::BATCH || lWaveform == xclemulation::DEBUG_MODE::OFF ) 
+        && xclemulation::config::getInstance()->isInfoSuppressed() == false)
       {
         std::string waitingMsg ="INFO: [HW-EM 06-0] Waiting for the simulator process to exit";
         logMessage(waitingMsg);
@@ -1348,7 +1529,8 @@ uint32_t HwEmShim::getAddressSpace (uint32_t topology)
       if(!simDontRun)
         while (-1 == waitpid(0, &status, 0));
 
-      if(( lWaveform == xclemulation::LAUNCHWAVEFORM::GUI || lWaveform == xclemulation::LAUNCHWAVEFORM::BATCH) && xclemulation::config::getInstance()->isInfoSuppressed() == false)
+      if(( lWaveform == xclemulation::DEBUG_MODE::GUI || lWaveform == xclemulation::DEBUG_MODE::BATCH || lWaveform == xclemulation::DEBUG_MODE::OFF )
+        && xclemulation::config::getInstance()->isInfoSuppressed() == false)
       {
         std::string waitingMsg ="INFO: [HW-EM 06-1] All the simulator processes exited successfully";
         logMessage(waitingMsg);
@@ -1487,6 +1669,9 @@ uint32_t HwEmShim::getAddressSpace (uint32_t topology)
 
     deviceName = "device"+std::to_string(deviceIndex);
     deviceDirectory = xclemulation::getRunDirectory() +"/" + std::to_string(getpid())+"/hw_em/"+deviceName;
+    
+    systemUtil::makeSystemCall(deviceDirectory, systemUtil::systemOperation::CREATE);
+    systemUtil::makeSystemCall(deviceDirectory, systemUtil::systemOperation::PERMISSIONS, "777");
 
     std::memset(&mDeviceInfo, 0, sizeof(xclDeviceInfo2));
     fillDeviceInfo(&mDeviceInfo,&info);
@@ -1501,9 +1686,10 @@ uint32_t HwEmShim::getAddressSpace (uint32_t topology)
 
     // Delete detailed kernel trace data mining results file
     // NOTE: do this only if we're going to write a new one
-    xclemulation::LAUNCHWAVEFORM lWaveform = xclemulation::config::getInstance()->getLaunchWaveform();
-    if (lWaveform == xclemulation::LAUNCHWAVEFORM::GUI
-        || lWaveform == xclemulation::LAUNCHWAVEFORM::BATCH) {
+    xclemulation::DEBUG_MODE lWaveform = xclemulation::config::getInstance()->getLaunchWaveform();
+    if (lWaveform == xclemulation::DEBUG_MODE::GUI
+        || lWaveform == xclemulation::DEBUG_MODE::BATCH
+        || lWaveform == xclemulation::DEBUG_MODE::OFF) {
       char path[FILENAME_MAX];
       size_t size = MAXPATHLEN;
       char* pPath = GetCurrentDir(path,size);
@@ -1532,6 +1718,7 @@ uint32_t HwEmShim::getAddressSpace (uint32_t topology)
     mCuBaseAddress = 0x0;
     mMessengerThreadStarted = false;
     mIsTraceHubAvailable = false;
+    mVersalPlatform=false;
   }
 
   bool HwEmShim::isMBSchedulerEnabled()
@@ -1558,7 +1745,7 @@ uint32_t HwEmShim::getAddressSpace (uint32_t topology)
         || vbnv.find("u200_xdma_201830_2")        != std::string::npos 
         || vbnv.find("u250_qep_201910_1")         != std::string::npos
         || vbnv.find("u250_xdma_201830_1")        != std::string::npos 
-        || vbnv.find("u250_xdma_201830_2")        != std::string::npos 
+        || vbnv.find("u250_xdma_201830_2")        != std::string::npos
         || vbnv.find("u280_xdma_201920_1")        != std::string::npos
         || vbnv.find("u280_xdma_201920_2")        != std::string::npos
         || vbnv.find("u280_xdma_201920_3")        != std::string::npos
@@ -1803,6 +1990,11 @@ uint32_t HwEmShim::getAddressSpace (uint32_t topology)
       mGlobalInMemStream.open("global_in.mem");
       mGlobalOutMemStream.open("global_out.mem");
     }
+
+    // Shim object creation doesn't follow xclOpen/xclClose.
+    // The core device must correspond to open and close, so
+    // create here rather than in constructor
+    mCoreDevice = xrt_core::hwemu::get_userpf_device(this, mDeviceIndex);
   }
 
 /**********************************************HAL2 API's START HERE **********************************************/
@@ -1994,7 +2186,7 @@ int HwEmShim::xclExportBO(unsigned int boHandle)
     munmap(data,size);
     return -1;
   }
-  mFdToFileNameMap [fd] = std::make_tuple(sFileName,size,(void*)data);
+  mFdToFileNameMap [fd] = std::make_tuple(sFileName,size,(void*)data,bo->flags);
   PRINTENDFUNC;
   return fd;
 }
@@ -2013,8 +2205,9 @@ unsigned int HwEmShim::xclImportBO(int boGlobalHandle, unsigned flags)
   {
     const std::string& fileName = std::get<0>((*itr).second);
     int size = std::get<1>((*itr).second);
+    unsigned boFlags = std::get<3>((*itr).second);
 
-    unsigned int importedBo = xclAllocBO(size, 0, flags);
+    unsigned int importedBo = xclAllocBO(size, 0, boFlags);
     xclemulation::drm_xocl_bo* bo = xclGetBoByHandle(importedBo);
     if(!bo)
     {
@@ -2114,7 +2307,7 @@ void *HwEmShim::xclMapBO(unsigned int boHandle, bool write)
       munmap(data,bo->size);
       return nullptr;
     }
-    mFdToFileNameMap [fd] = std::make_tuple(sFileName,bo->size,(void*)data);
+    mFdToFileNameMap [fd] = std::make_tuple(sFileName,bo->size,(void*)data, bo->flags);
     bo->buf = data;
     PRINTENDFUNC;
     return data;
@@ -2193,10 +2386,15 @@ void HwEmShim::xclFreeBO(unsigned int boHandle)
     PRINTENDFUNC;
     return;
   }
+
   xclemulation::drm_xocl_bo* bo = (*it).second;;
   if(bo)
   {
-    xclFreeDeviceBuffer(bo->base);
+    bool bSendToSim = true;
+    if(bo->flags & XCL_BO_FLAGS_EXECBUF)
+      bSendToSim = false;
+    
+    xclFreeDeviceBuffer(bo->base, bSendToSim);
     mXoclObjMap.erase(it);
   }
   PRINTENDFUNC;
@@ -2630,16 +2828,14 @@ int HwEmShim::xclPollCompletion(int min_compl, int max_compl, xclReqCompletion *
   {
     mLogStream << __func__ << ", " << std::this_thread::get_id() << " , "<< max_compl <<", "<<min_compl<<" ," << *actual <<" ," << timeout << std::endl;
   }
-//  struct timespec time, *ptime = NULL;
-//
-//  if (timeout > 0) 
-//  {
-//    memset(&time, 0, sizeof(time));
-//    time.tv_sec = timeout / 1000;
-//    time.tv_nsec = (timeout % 1000) * 1000000;
-//    ptime = &time;
-//  }
+  xclemulation::TIMEOUT_SCALE timeout_scale=xclemulation::config::getInstance()->getTimeOutScale();
+  if(timeout_scale==xclemulation::TIMEOUT_SCALE::NA) {
+      std::string dMsg = "WARNING: [HW-EMU 10] xclPollCompletion : Timeout is not enabled in emulation by default.Please use xrt.ini (key: timeout_scale=ms|sec|min) to enable";
+      logMessage(dMsg, 0); 
+  }
 
+  xclemulation::ApiWatchdog watch(timeout_scale,timeout);
+  watch.reset();
   *actual = 0;
   while(*actual < min_compl)
   {
@@ -2662,6 +2858,11 @@ int HwEmShim::xclPollCompletion(int min_compl, int max_compl, xclReqCompletion *
       {
         it++;
       }
+      if(watch.isTimeout()) {
+    	 PRINTENDFUNC;
+    	 return -1;
+     }
+
     }
   }
   PRINTENDFUNC;
@@ -2734,11 +2935,65 @@ int HwEmShim::xclLogMsg(xclDeviceHandle handle, xrtLogMsgLevel level, const char
     return 0;
 }
 
-void HwEmShim::closemMessengerThread() {
-	if(mMessengerThreadStarted) {
-		mMessengerThread.join();
-		mMessengerThreadStarted = false;
-	}
+  void HwEmShim::closemMessengerThread() {
+	  if(mMessengerThreadStarted) {
+		  mMessengerThread.join();
+		  mMessengerThreadStarted = false;
+	  }
+  }
+
+//CU register space for xclRegRead/Write()
+int HwEmShim::xclRegRW(bool rd, uint32_t cu_index, uint32_t offset, uint32_t *datap)
+{
+  if (mLogStream.is_open()) {
+    mLogStream << __func__ << ", " << std::this_thread::get_id() << ", " << "CU Idx : " << cu_index << " Offset : " << offset << " Datap : " << (*datap) << std::endl;
+  }
+
+  std::string strCuidx = boost::lexical_cast<std::string>(cu_index);
+  if (cu_index >= mCuIndxVsBaseAddrMap.size()) {
+    std::string strMsg = "ERROR: [HW-EM 20] xclRegRW - invalid CU index: " + strCuidx;
+    logMessage(strMsg);
+    return -EINVAL;
+  }
+  if (offset >= mCuMapSize || (offset & (sizeof(uint32_t) - 1)) != 0) {
+    std::string strOffset = boost::lexical_cast<std::string>(offset);
+    std::string strMsg = "ERROR: [HW-EM 21] xclRegRW - invalid CU offset: " + strOffset;
+    logMessage(strMsg);   
+    return -EINVAL;
+  }
+  char *buff = new char[REG_BUFF_SIZE];
+  std::memset(buff, 0, sizeof(char)*REG_BUFF_SIZE);
+
+  uint64_t baseAddr = mCuIndxVsBaseAddrMap[cu_index] + offset;
+    if (rd) {
+      if (xclRead(XCL_ADDR_KERNEL_CTRL, baseAddr, buff, REG_BUFF_SIZE) != REG_BUFF_SIZE) {
+        std::string strMsg = "ERROR: [HW-EM 22] xclRegRW - xclRead failed for CU: " + strCuidx;
+        logMessage(strMsg);
+        return -EINVAL;
+      }  
+      uint32_t * tmp_buff = (uint32_t *) buff;
+      *datap = tmp_buff[0];
+    }
+    else {
+      uint32_t * tmp_buff = (uint32_t *)buff;
+      tmp_buff[0] = *datap;
+      if (xclWrite(XCL_ADDR_KERNEL_CTRL, baseAddr, tmp_buff, REG_BUFF_SIZE) != REG_BUFF_SIZE) {
+        std::string strMsg = "ERROR: [HW-EM 23] xclRegRW - xclWrite failed for CU: " + strCuidx;
+        logMessage(strMsg);
+        return -EINVAL;
+      }
+    } 
+  return 0;
+}
+
+int HwEmShim::xclRegRead(uint32_t cu_index, uint32_t offset, uint32_t *datap)
+{
+  return xclRegRW(true, cu_index, offset, datap);
+}
+
+int HwEmShim::xclRegWrite(uint32_t cu_index, uint32_t offset, uint32_t data)
+{
+  return xclRegRW(false, cu_index, offset, &data);
 }
 /********************************************** QDMA APIs IMPLEMENTATION END**********************************************/
 /**********************************************HAL2 API's END HERE **********************************************/

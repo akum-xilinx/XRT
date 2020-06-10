@@ -16,15 +16,12 @@
 #define XRT_CORE_PCIE_WINDOWS_SOURCE
 #define XCL_DRIVER_DLL_EXPORT
 #include "device_windows.h"
-#include "core/common/query_requests.h"
 #include "mgmt.h"
 #include "shim.h"
-#include "common/utils.h"
-#include "xrt.h"
-#include "xclfeatures.h"
-
-//#include "core/pcie/driver/windows/include/XoclUser_INTF.h"
-//#include "core/pcie/driver/windows/include/XoclMgmt_INTF.h"
+#include "core/common/query_requests.h"
+#include "core/common/utils.h"
+#include "core/include/xrt.h"
+#include "core/include/xclfeatures.h"
 
 #include <boost/format.hpp>
 #include <type_traits>
@@ -89,6 +86,40 @@ struct board_name
   mgmt(const xrt_core::device* device, key_type key)
   {
     return "TO-DO";
+  }
+};
+
+struct logic_uuids
+{
+  using result_type = std::vector<std::string>;
+
+  static result_type
+  user(const xrt_core::device* device, key_type key)
+  {
+    return std::vector<std::string>{"TO-DO"};
+  }
+
+  static result_type
+  mgmt(const xrt_core::device* device, key_type key)
+  {
+    return std::vector<std::string>{"TO-DO"};
+  }
+};
+
+struct interface_uuids
+{
+  using result_type = std::vector<std::string>;
+
+  static result_type
+  user(const xrt_core::device* device, key_type key)
+  {
+    return std::vector<std::string>{"TO-DO"};
+  }
+
+  static result_type
+  mgmt(const xrt_core::device* device, key_type key)
+  {
+    return std::vector<std::string>{"TO-DO"};
   }
 };
 
@@ -448,8 +479,8 @@ struct icap
     const xcl_hwicap& info = (*it).second;
 
     switch (key) {
-    case key_type::clock_freqs:
-      return query::clock_freqs::result_type {
+    case key_type::clock_freqs_mhz:
+      return query::clock_freqs_mhz::result_type {
         std::to_string(info.freq_0),
         std::to_string(info.freq_1),
         std::to_string(info.freq_2),
@@ -459,6 +490,11 @@ struct icap
       return query::idcode::result_type(info.idcode);
     case key_type::status_mig_calibrated:
       return query::status_mig_calibrated::result_type(info.mig_calib);
+    case key_type::xclbin_uuid: {
+      char uuid_str[64] = { 0 };
+      uuid_unparse_lower(info.uuid, uuid_str);
+      return query::xclbin_uuid::result_type(uuid_str);
+    }
     default:
       throw std::runtime_error("device_windows::icap() unexpected qr("
                                + std::to_string(static_cast<qtype>(key))
@@ -678,8 +714,8 @@ struct rom
     switch (key) {
     case key_type::rom_vbnv:
       return std::string(reinterpret_cast<const char*>(hdr.VBNVName));
-    case key_type::rom_ddr_bank_size:
-      return static_cast<query::rom_ddr_bank_size::result_type>(hdr.DDRChannelSize);
+    case key_type::rom_ddr_bank_size_gb:
+      return static_cast<query::rom_ddr_bank_size_gb::result_type>(hdr.DDRChannelSize);
     case key_type::rom_ddr_bank_count_max:
       return static_cast<query::rom_ddr_bank_count_max::result_type>(hdr.DDRChannelCount);
     case key_type::rom_fpga_name:
@@ -782,7 +818,7 @@ initialize_query_table()
   emplace_function0_getter<query::pcie_subsystem_id,         info>();
   emplace_function0_getter<query::pcie_bdf,                  bdf>();
   emplace_function0_getter<query::rom_vbnv,                  rom>();
-  emplace_function0_getter<query::rom_ddr_bank_size,         rom>();
+  emplace_function0_getter<query::rom_ddr_bank_size_gb,      rom>();
   emplace_function0_getter<query::rom_ddr_bank_count_max,    rom>();
   emplace_function0_getter<query::rom_fpga_name,             rom>();
   //emplace_function0_getter<query::rom_raw,                 rom>();
@@ -790,9 +826,10 @@ initialize_query_table()
   emplace_function0_getter<query::rom_time_since_epoch,      rom>();
   emplace_function0_getter<query::mem_topology_raw,          xclbin>();
   emplace_function0_getter<query::ip_layout_raw,             xclbin>();
-  emplace_function0_getter<query::clock_freqs,               icap>();
+  emplace_function0_getter<query::clock_freqs_mhz,           icap>();
   emplace_function0_getter<query::idcode,                    icap>();
   emplace_function0_getter<query::status_mig_calibrated,     icap>();
+  emplace_function0_getter<query::xclbin_uuid,               icap>();
   emplace_function0_getter<query::v12v_pex_millivolts,       sensor>();
   emplace_function0_getter<query::v12v_aux_millivolts,       sensor>();
   emplace_function0_getter<query::v12v_pex_milliamps,        sensor>();
@@ -866,31 +903,17 @@ lookup_query(query::key_type query_key) const
 {
   auto it = query_tbl.find(query_key);
 
-  if (it == query_tbl.end()) {
-    using qtype = std::underlying_type<query::key_type>::type;
-    std::string err = boost::str( boost::format("The given query request ID (%d) is not supported on Linux.")
-                                  % static_cast<qtype>(query_key));
-    throw std::runtime_error(err);
-  }
+  if (it == query_tbl.end())
+    throw query::no_such_key(query_key);
 
   return *(it->second);
 }
 
 device_windows::
-device_windows(id_type device_id, bool user)
-  : shim<device_pcie>(device_id, user)
-{
-  if (user)
-    return;
-
-  m_mgmthdl = mgmtpf::open(device_id);
-}
-
-device_windows::
-device_windows(handle_type device_handle, id_type device_id)
-  : shim<device_pcie>(device_handle, device_id)
-{
-}
+device_windows(handle_type device_handle, id_type device_id, bool user)
+  : shim<device_pcie>(user ? device_handle : nullptr, device_id, user)
+  , m_mgmthdl(user ? nullptr : device_handle)
+{}
 
 device_windows::
 ~device_windows()
@@ -923,6 +946,13 @@ write(uint64_t addr, const void* buf, uint64_t len) const
     throw std::runtime_error("");
 
   mgmtpf::write_bar(m_mgmthdl, addr, buf, len);
+}
+
+void 
+device_windows::
+reset(const char*, const char*, const char*) const 
+{
+  throw std::runtime_error("Reset is not supported on Windows.");
 }
 
 /* TODO: after 2020.1

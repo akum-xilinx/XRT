@@ -35,14 +35,18 @@
 #include <mutex>
 #include <memory>
 
+#ifdef XRT_ENABLE_AIE
+#include "core/edge/user/aie/aie.h"
+#endif
+
 namespace ZYNQ {
 
-class ZYNQShim {
+class shim {
 
   static const int BUFFER_ALIGNMENT = 0x80; // TODO: UKP
 public:
-  ~ZYNQShim();
-  ZYNQShim(unsigned index, const char *logfileName,
+  ~shim();
+  shim(unsigned index, const char *logfileName,
            xclVerbosityLevel verbosity);
 
   int mapKernelControl(const std::vector<std::pair<uint64_t, size_t>>& offsets);
@@ -105,26 +109,32 @@ public:
   int xclCloseIPInterruptNotify(int fd);
 
   bool isGood() const;
-  static ZYNQShim *handleCheck(void *handle);
-  int xclIPName2Index(const char *name, uint32_t& index);
+  static shim *handleCheck(void *handle);
+  int xclIPName2Index(const char *name);
   static int xclLogMsg(xrtLogMsgLevel level, const char* tag,
 		       const char* format, va_list args);
-  
-  // Application debug path functionality for xbutil  
+
+  // Application debug path functionality for xbutil
   size_t xclDebugReadCheckers(xclDebugCheckersResults* aCheckerResults);
   size_t xclDebugReadCounters(xclDebugCountersResults* aCounterResults);
   size_t xclDebugReadAccelMonitorCounters(xclAccelMonitorCounterResults* samResult);
   size_t xclDebugReadStreamingCounters(xclStreamingDebugCountersResults* aCounterResults);
   size_t xclDebugReadStreamingCheckers(xclDebugStreamingCheckersResults* aStreamingCheckerResults);
-  uint32_t getIPCountAddrNames(int type, uint64_t* baseAddress, 
+  uint32_t getIPCountAddrNames(int type, uint64_t* baseAddress,
                               std::string* portNames,
                               uint8_t* properties, uint8_t* majorVersions,
                               uint8_t* minorVersions, size_t size) ;
-  int cmpMonVersions(unsigned int major1, unsigned int minor1, 
+  int cmpMonVersions(unsigned int major1, unsigned int minor1,
 		     unsigned int major2, unsigned int minor2);
 
+#ifdef XRT_ENABLE_AIE
+  zynqaie::Aie *getAieArray();
+  void setAieArray(zynqaie::Aie *aie);
+  int getBOInfo(unsigned bo, drm_zocl_info_bo &info);
+#endif
 
 private:
+  std::shared_ptr<xrt_core::device> mCoreDevice;
   const int mBoardNumber = -1;
   std::ofstream mLogStream;
   std::ifstream mVBNV;
@@ -133,7 +143,6 @@ private:
   std::map<uint64_t, uint32_t *> mKernelControl;
   std::unique_ptr<xrt_core::bo_cache> mCmdBOCache;
   zynq_device *mDev = nullptr;
-  std::shared_ptr<xrt_core::device> mCoreDevice;
   size_t mKernelClockFreq;
 
   /*
@@ -145,6 +154,10 @@ private:
   std::mutex mCuMapLock;
   int xclRegRW(bool rd, uint32_t cu_index, uint32_t offset, uint32_t *datap);
   int xclLog(xrtLogMsgLevel level, const char* tag, const char* format, ...);
+
+#ifdef XRT_ENABLE_AIE
+  zynqaie::Aie *aieArray;
+#endif
 };
 
 } // namespace ZYNQ

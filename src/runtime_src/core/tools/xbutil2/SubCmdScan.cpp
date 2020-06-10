@@ -35,7 +35,7 @@ namespace po = boost::program_options;
 // ----- C L A S S   M E T H O D S -------------------------------------------
 
 SubCmdScan::SubCmdScan(bool _isHidden, bool _isDepricated, bool _isPreliminary)
-    : SubCmd("scan", 
+    : SubCmd("scan",
              "See replacement functionality in command: 'advanced'")
 {
   const std::string longDescription = "<add long description>";
@@ -56,22 +56,28 @@ SubCmdScan::execute(const SubCmdOptions& _options) const
   bool help = false;
   uint64_t card = 0;
 
-  po::options_description scanDesc("scan options");
+  po::options_description commonOptions("Common Options");
 
-  scanDesc.add_options()
+  commonOptions.add_options()
     ("help", boost::program_options::bool_switch(&help), "Help to use this sub-command")
     (",d", boost::program_options::value<uint64_t>(&card), "Card to be examined")
   ;
+
+  po::options_description hiddenOptions("Hidden Options");
+
+  po::options_description allOptions("All Options");
+  allOptions.add(commonOptions);
+  allOptions.add(hiddenOptions);
 
   // Parse sub-command ...
   po::variables_map vm;
 
   try {
-    po::store(po::command_line_parser(_options).options(scanDesc).run(), vm);
+    po::store(po::command_line_parser(_options).options(allOptions).run(), vm);
     po::notify(vm); // Can throw
   } catch (po::error& e) {
     xrt_core::send_exception_message(e.what(), "XBUTIL");
-    printHelp(scanDesc);
+    printHelp(commonOptions, hiddenOptions);
 
     // Re-throw exception
     throw;
@@ -79,7 +85,7 @@ SubCmdScan::execute(const SubCmdOptions& _options) const
 
   // Check to see if help was requested or no command was found
   if (help == true)  {
-    printHelp(scanDesc);
+    printHelp(commonOptions, hiddenOptions);
     return;
   }
 
@@ -90,8 +96,11 @@ SubCmdScan::execute(const SubCmdOptions& _options) const
 
   // Walk the property tree and print info
   auto devices = pt.get_child_optional("devices");
-  if (!devices || (*devices).size()==0)
-    throw xrt_core::error("No devices found");
+  if (!devices || devices->size()==0) {
+    // No devices when scanning is not an error condition
+    std::cout << "No devices found" << std::endl;
+    return;
+  }
 
   std::cout << "INFO: Found total " << (*devices).size() << " card(s), " << "TBD" << " are usable.\n";
   for (auto& device : *devices) {

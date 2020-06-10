@@ -1,5 +1,5 @@
 /**
- * Copyright (C) 2019 Xilinx, Inc
+ * Copyright (C) 2019-2020 Xilinx, Inc
  *
  * Licensed under the Apache License, Version 2.0 (the "License"). You may
  * not use this file except in compliance with the License. A copy of the
@@ -15,6 +15,8 @@
  */
 
 #include "scheduler.h"
+#include "system.h"
+#include "device.h"
 #include "config_reader.h"
 #include "xclbin_parser.h"
 #include "message.h"
@@ -23,7 +25,9 @@
 
 #include <memory>
 #include <string>
+#include <stdexcept>
 #include <cstring>
+#include <iostream>
 
 #ifdef __GNUC__
 #include <sys/mman.h>
@@ -96,18 +100,21 @@ create_data_bo(xclDeviceHandle handle, size_t sz, uint32_t flags)
 {
   auto delBO = [](buffer_object* bo) {
     xclUnmapBO(bo->dev, bo->bo, bo->data);
-    xclFreeBO(bo->dev,bo->bo);
+    xclFreeBO(bo->dev, bo->bo);
     delete bo;
   };
 
   auto ubo = std::make_unique<buffer_object>();
   ubo->dev = handle;
-  ubo->bo = xclAllocBO(ubo->dev,sz,0,flags);
-  ubo->data = xclMapBO(ubo->dev,ubo->bo,true /*write*/);
-  xclGetBOProperties(ubo->dev, ubo->bo, &ubo->prop);
+  ubo->bo = xclAllocBO(ubo->dev, sz, 0, flags);
+  ubo->data = xclMapBO(ubo->dev, ubo->bo, true /*write*/);
+
+  if (xclGetBOProperties(ubo->dev, ubo->bo, &ubo->prop))
+    throw std::runtime_error("Failed to get BO properties");
+
   ubo->size = sz;
-  std::memset(reinterpret_cast<ert_packet*>(ubo->data),0,sz);
-  return buffer(ubo.release(),delBO);
+  std::memset(reinterpret_cast<ert_packet*>(ubo->data), 0, sz);
+  return buffer(ubo.release(), delBO);
 }
 
 } // unnamed
@@ -127,16 +134,19 @@ namespace xrt_core { namespace scheduler {
 int
 init(xclDeviceHandle handle, const axlf* top)
 {
-  xuid_t uuid = {0};
   auto execbo = create_exec_bo(handle,0x1000);
   auto ecmd = reinterpret_cast<ert_configure_cmd*>(execbo->data);
   ecmd->state = ERT_CMD_STATE_NEW;
   ecmd->opcode = ERT_CONFIGURE;
   ecmd->type = ERT_CTRL;
 
-  auto cus = xclbin::get_cus(top, true);
+  auto device = xrt_core::get_userpf_device(handle);
+  ecmd->slot_size = device->get_ert_slots().second;
 
-  ecmd->slot_size = config::get_ert_slotsize();
+  if (ecmd->slot_size != 4096)
+    std::cout << "ERT slotsize computed to: " << ecmd->slot_size << "\n";
+  
+  auto cus = xclbin::get_cus(top, true);
   ecmd->num_cus = cus.size();
   ecmd->cu_shift = 16;
   ecmd->cu_base_addr = xclbin::get_cu_base_offset(top);
@@ -151,6 +161,7 @@ init(xclDeviceHandle handle, const axlf* top)
   std::copy(cus.begin(), cus.end(), ecmd->data);
   ecmd->count = 5 + cus.size();
 
+  xuid_t uuid = {0};
   uuid_copy(uuid, top->m_header.uuid);
   if (xclOpenContext(handle,uuid,std::numeric_limits<unsigned int>::max(),true))
     throw std::runtime_error("unable to reserve virtual CU");
@@ -184,12 +195,12 @@ init(xclDeviceHandle handle, const axlf* top)
       scmd->count = sizeof (ert_configure_sk_cmd) / 4 - 1;
       scmd->start_cuidx = start_cuidx;
       scmd->num_cus = sk.ninst;
-      std::strncpy(reinterpret_cast<char*>(scmd->sk_name), sk.symbol_name, 31);
-      reinterpret_cast<char*>(scmd->sk_name)[31] = 0;
+      sk.symbol_name.copy(reinterpret_cast<char*>(scmd->sk_name), 31);
       scmd->sk_addr = skbo->prop.paddr;
       scmd->sk_size = skbo->prop.size;
       std::memcpy(skbo->data, sk.sk_buf, sk.size);
-      xclSyncBO(handle, skbo->bo, XCL_BO_SYNC_BO_TO_DEVICE, sk.size, 0);
+      if (xclSyncBO(handle, skbo->bo, XCL_BO_SYNC_BO_TO_DEVICE, sk.size, 0))
+	    throw std::runtime_error("unable to synch BO to device");
 
       if (xclExecBuf(handle,execbo->bo))
         throw std::runtime_error("unable to issue xclExecBuf");
@@ -203,52 +214,6 @@ init(xclDeviceHandle handle, const axlf* top)
   }
 
   xclCloseContext(handle,uuid,std::numeric_limits<unsigned int>::max());
-
-  return 0;
-}
-
-/**
- * loadXclbinToPS() - Load the whole xclbin to PS
- *
- * Load the whole XCLBIN to PS memory by ERT_SK_CONFIG
- * command.
- */
-int
-loadXclbinToPS(xclDeviceHandle handle, const axlf* top)
-{
-  xuid_t uuid;
-  auto execbo = create_exec_bo(handle,0x1000);
-  auto ecmd = reinterpret_cast<ert_configure_sk_cmd*>(execbo->data);
-  ecmd->state = ERT_CMD_STATE_NEW;
-  ecmd->opcode = ERT_SK_CONFIG;
-  ecmd->type = ERT_CTRL;
-  ecmd->count = 13;
-  ecmd->start_cuidx = 0;
-  ecmd->sk_type = SOFTKERNEL_TYPE_XCLBIN;
-  ecmd->num_cus = 0;
-
-  auto flags = xclbin::get_first_used_mem(top);
-  if (flags < 0)
-    throw std::runtime_error("unable to get available memory bank");
-
-  auto skbo = create_data_bo(handle, top->m_header.m_length, flags);
-  ecmd->sk_addr = skbo->prop.paddr;
-  ecmd->sk_size = skbo->prop.size;
-  std::memcpy(skbo->data, top, skbo->size);
-  xclSyncBO(handle, skbo->bo, XCL_BO_SYNC_BO_TO_DEVICE, skbo->size, 0);
-
-  uuid_copy(uuid, top->m_header.uuid);
-  if (xclOpenContext(handle,uuid,-1,true))
-    throw std::runtime_error("unable to reserve virtual CU");
-
-  if (xclExecBuf(handle,execbo->bo))
-    throw std::runtime_error("unable to issue xclExecBuf");
-
-  // wait for command to complete
-  while (ecmd->state < ERT_CMD_STATE_COMPLETED)
-    while (xclExecWait(handle,1000)==0) ;
-
-  (void) xclCloseContext(handle,uuid,-1);
 
   return 0;
 }

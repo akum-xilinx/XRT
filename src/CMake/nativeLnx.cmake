@@ -19,7 +19,7 @@ ELSE(DRM_FOUND)
 ENDIF(DRM_FOUND)
 
 
-# --- OpenCL header files --- 
+# --- OpenCL header files ---
 pkg_check_modules(OPENCL REQUIRED OpenCL)
 IF(OPENCL_FOUND)
   MESSAGE(STATUS "Looking for OPENCL - found at ${OPENCL_PREFIX} ${OPENCL_VERSION} ${OPENCL_INCLUDEDIR}")
@@ -59,30 +59,37 @@ execute_process(COMMAND ${UNAME} -r
 # --- Boost ---
 #set(Boost_DEBUG 1)
 
-INCLUDE (FindBoost)
-
-# On older systems libboost_system.a is not compiled with -fPIC which leads to
-# link errors when XRT shared objects try to link with it.
-
-# Static linking with Boost is enabled on Ubuntu 18.04 and later versions.
-if ((${LINUX_FLAVOR} STREQUAL Ubuntu) AND (${LINUX_VERSION} VERSION_GREATER 17.10))
-   set(Boost_USE_STATIC_LIBS  ON)
+if (DEFINED ENV{XRT_BOOST_INSTALL})
+  set(XRT_BOOST_INSTALL $ENV{XRT_BOOST_INSTALL})
+  set(Boost_USE_STATIC_LIBS ON)
+  find_package(Boost 
+    HINTS $ENV{XRT_BOOST_INSTALL}
+    REQUIRED COMPONENTS system filesystem)
+else()
+  # On older systems libboost_system.a is not compiled with -fPIC which leads to
+  # link errors when XRT shared objects try to link with it.
+  # Static linking with Boost is enabled on Ubuntu 18.04 but not 20.04
+  if ((${LINUX_FLAVOR} STREQUAL Ubuntu) AND (${LINUX_VERSION} STREQUAL 18.04))
+    set(Boost_USE_STATIC_LIBS  ON)
+  endif()
+  find_package(Boost 
+    REQUIRED COMPONENTS system filesystem)
 endif()
+set(Boost_USE_MULTITHREADED ON)             # Multi-threaded libraries
 
-if (${LINUX_FLAVOR} STREQUAL pynqlinux)
-   set(Boost_USE_STATIC_LIBS  ON)
-endif()
-
-find_package(Boost REQUIRED COMPONENTS system filesystem )
+include_directories(${Boost_INCLUDE_DIRS})
+add_compile_options("-DBOOST_LOCALE_HIDE_AUTO_PTR")
 
 # -- Cursers ---
 INCLUDE (FindCurses)
 find_package(Curses REQUIRED)
 
-
 # --- XRT Variables ---
-set (XRT_INSTALL_DIR "${CMAKE_INSTALL_PREFIX}/xrt")
-set (XRT_INSTALL_INCLUDE_DIR "${XRT_INSTALL_DIR}/include")
+set (XRT_INSTALL_DIR           "${CMAKE_INSTALL_PREFIX}/xrt")
+set (XRT_INSTALL_BIN_DIR       "${XRT_INSTALL_DIR}/bin")
+set (XRT_INSTALL_UNWRAPPED_DIR "${XRT_INSTALL_BIN_DIR}/unwrapped")
+set (XRT_INSTALL_INCLUDE_DIR   "${XRT_INSTALL_DIR}/include")
+set (XRT_INSTALL_LIB_DIR       "${XRT_INSTALL_DIR}/lib${LIB_SUFFIX}")
 
 # --- Release: OpenCL extension headers ---
 set(XRT_CL_EXT_SRC
@@ -122,9 +129,6 @@ set(XMA_SOVERSION ${XRT_SOVERSION})
 add_subdirectory(xma)
 #XMA settings END
 
-#XBTest
-add_subdirectory(xbtest)
-
 # --- Python bindings ---
 set(PY_INSTALL_DIR "${XRT_INSTALL_DIR}/python")
 add_subdirectory(python)
@@ -133,8 +137,11 @@ add_subdirectory(python)
 set(PY_TEST_SRC
   ../tests/python/22_verify/22_verify.py
   ../tests/python/utils_binding.py
-  ../tests/pyopencl/23_bandwidth.py)
-install (FILES ${PY_TEST_SRC} DESTINATION ${XRT_INSTALL_DIR}/test)
+  ../tests/python/23_bandwidth/23_bandwidth.py
+  ../tests/python/23_bandwidth/versal_23_bandwidth.py)
+install (FILES ${PY_TEST_SRC}
+  PERMISSIONS OWNER_READ OWNER_EXECUTE OWNER_WRITE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE
+  DESTINATION ${XRT_INSTALL_DIR}/test)
 
 message("-- XRT version: ${XRT_VERSION_STRING}")
 
@@ -165,4 +172,3 @@ include (CMake/coverity.cmake)
 
 set (CTAGS "${CMAKE_SOURCE_DIR}/runtime_src/tools/scripts/tags.sh")
 include (CMake/tags.cmake)
-

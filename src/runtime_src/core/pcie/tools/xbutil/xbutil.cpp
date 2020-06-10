@@ -89,6 +89,35 @@ static int str2index(const char *arg, unsigned& index)
     return 0;
 }
 
+static bool
+check_os_release(const std::vector<std::string> kernel_versions, std::ostream &ostr)
+{
+    const std::string release = sensor_tree::get<std::string>("system.release");
+    for (const auto& ver : kernel_versions) {
+        if (release.find(ver) != std::string::npos)
+            return true;
+    }
+    ostr << "WARNING: Kernel verison " << release << " is not officially supported. " 
+        << kernel_versions.back() << " is the latest supported version" << std::endl;
+    return false;
+}
+
+static bool
+is_supported_kernel_version(std::ostream &ostr)
+{
+    std::vector<std::string> ubuntu_kernel_versions =
+        { "4.4.0", "4.13.0", "4.15.0", "4.18.0", "5.0.0", "5.3.0" };
+    std::vector<std::string> centos_rh_kernel_versions =
+        { "3.10.0-693", "3.10.0-862", "3.10.0-957", "3.10.0-1062" };
+    const std::string os = sensor_tree::get<std::string>("system.linux", "N/A");
+
+    if(os.find("Ubuntu") != std::string::npos)
+        return check_os_release(ubuntu_kernel_versions, ostr);
+    else if(os.find("Red Hat") != std::string::npos || os.find("CentOS") != std::string::npos)
+        return check_os_release(centos_rh_kernel_versions, ostr);
+    
+    return true;
+}
 
 static void print_pci_info(std::ostream &ostr)
 {
@@ -108,18 +137,13 @@ static void print_pci_info(std::ostream &ostr)
     }
 
     if (pcidev::get_dev_total() != pcidev::get_dev_ready()) {
-        ostr << "WARNING: "
-            << "card(s) marked by '*' are not ready, is MPD runing? "
-            << "run 'systemctl status mpd' to check MPD details.";
-	    if (pcidev::get_dev_total(false) == 0)
-            ostr << std::endl;
-	    else
-            ostr << " please also run 'xbmgmt flash --scan --verbose' to further check card details."
-                << std::endl;
+        ostr << "WARNING: card(s) marked by '*' are not ready." << std::endl;
     }
+
+    is_supported_kernel_version(ostr);
 }
 
-static int xrt_xbutil_version_cmp() 
+static int xrt_xbutil_version_cmp()
 {
     /*check xbutil tools and xrt versions*/
     std::string xrt = "";
@@ -220,7 +244,7 @@ int main(int argc, char *argv[])
         return xcldev::xclReset(argc, argv);
     } else if( std::strcmp( argv[1], "p2p" ) == 0 ) {
         return xcldev::xclP2p(argc, argv);
-    } else if( std::strcmp( argv[1], "cma" ) == 0 ) {
+    } else if( std::strcmp( argv[1], "host_mem" ) == 0 ) {
         return xcldev::xclCma(argc, argv);
     }
     optind--;
@@ -506,7 +530,7 @@ int main(int argc, char *argv[])
             }
 
             if (blockSize > 0x100000) {
-                std::cout << "ERROR: block size cannot be greater than 0x100000 MB\n";
+                std::cout << "ERROR: block size cannot be greater than 0x100000 KB\n";
                 return -1;
             }
             blockSize *= 1024; // convert kilo bytes to bytes
@@ -578,7 +602,12 @@ int main(int argc, char *argv[])
     if (total == 0) {
         if (cmd == xcldev::DUMP)
             sensor_tree::json_dump( std::cout );
-        return -ENODEV;
+        // Querying a card with index 0 when it does not exist is an error
+        if (cmd == xcldev::QUERY)
+            return -ENODEV;
+        // Enumerating cards when none exist is not an error
+        if ((cmd == xcldev::SCAN) || (cmd == xcldev::LIST))
+            return 0;
     }
 
     if (cmd == xcldev::SCAN || cmd == xcldev::LIST) {
@@ -719,6 +748,8 @@ void xcldev::printHelp(const std::string& exe)
     std::cout << "  flash   [-d card] -a <all | shell> [-t timestamp]\n";
     std::cout << "  flash   [-d card] -p msp432_firmware\n";
     std::cout << "  flash   scan [-v]\n";
+    std::cout << "  host_mem   [-d card] --enable --[size sz M|G]\n";
+    std::cout << "  host_mem   [-d card] --disable\n";
     std::cout << "\nNOTE: card for -d option can either be id or bdf\n";
     std::cout << "\nExamples:\n";
     std::cout << "Print JSON file to stdout\n";
@@ -778,6 +809,8 @@ static void topPrintUsage(const xcldev::device *dev, xclDeviceUsage& devstat)
 {
     std::vector<std::string> lines;
 
+    dev->readSensors();
+
     dev->m_mem_usage_bar(devstat, lines);
 
     dev->sysfs_stringize_power(lines);
@@ -788,6 +821,7 @@ static void topPrintUsage(const xcldev::device *dev, xclDeviceUsage& devstat)
 
     dev->m_cu_usage_stringize_dynamics(lines);
 
+    dev->clearSensorTree();
     for(auto line:lines) {
             printw("%s\n", line.c_str());
     }
@@ -1061,6 +1095,7 @@ int searchXsaAndDsa(int index, std::string xsaPath, std::string
                 }
                 else
                 {
+                    iter.no_push(false);
                     closedir(dp);
                 }
 
@@ -1132,6 +1167,11 @@ int xcldev::device::runTestCase(const std::string& py,
     xclbinPath += xclbin;
 
     if (stat(xrtTestCasePath.c_str(), &st) != 0 || stat(xclbinPath.c_str(), &st) != 0) {
+        //if bandwidth xclbin isn't present, skip the test
+        if(xclbin.compare("bandwidth.xclbin") == 0) {
+            output += "Bandwidth xclbin not available. Skipping validation.";
+            return -EOPNOTSUPP;
+        }
         output += "ERROR: Failed to find ";
         output += py;
         output += " or ";
@@ -1148,13 +1188,7 @@ int xcldev::device::runTestCase(const std::string& py,
         return -EINVAL;
     }
 
-    // python3 is just for ppc+ubuntu setup for now. In postinst we install pyopencl with python2.7
-    // so can't default to python3 if it's available. Need to revisit this when 2.7 is deprecated (Jan 1, 2020)
-    #if _ARCH_PPC
-        std::string cmd = "/usr/bin/python3 " + xrtTestCasePath + " -k " + xclbinPath + " -d " + std::to_string(m_idx);
-    #else
-        std::string cmd = "/usr/bin/python " + xrtTestCasePath + " -k " + xclbinPath + " -d " + std::to_string(m_idx);
-    #endif
+    std::string cmd = "/usr/bin/python " + xrtTestCasePath + " -k " + xclbinPath + " -d " + std::to_string(m_idx);
     return runShellCmd(cmd, output);
 }
 
@@ -1187,8 +1221,14 @@ int xcldev::device::bandwidthKernelTest(void)
         return -EOPNOTSUPP;
     }
 
-    int ret = runTestCase(std::string("23_bandwidth.py"),
-        std::string("bandwidth.xclbin"), output);
+    //versal bandwidth kernel is different, hence it needs to run a custom testcase
+    std::string errmsg, vbnv;
+    pcidev::get_dev(m_idx)->sysfs_get("rom", "VBNV", errmsg, vbnv);
+
+    std::string testcase = (vbnv.find("vck5000") != std::string::npos) 
+        ? "versal_23_bandwidth.py" : "23_bandwidth.py";
+    
+    int ret = runTestCase(testcase, std::string("bandwidth.xclbin"), output);
 
     if (ret != 0) {
         std::cout << output << std::endl;
@@ -1222,7 +1262,7 @@ int xcldev::device::scVersionTest(void)
 
     pcidev::get_dev(m_idx)->sysfs_get("xmc", "bmc_ver", errmsg, sc_ver);
     pcidev::get_dev(m_idx)->sysfs_get("xmc", "exp_bmc_ver", errmsg, exp_sc_ver);
-    if (!exp_sc_ver.empty() && sc_ver.compare(exp_sc_ver) != 0)
+    if (!exp_sc_ver.empty() && (sc_ver.compare(exp_sc_ver) != 0 || sc_ver.empty()))
     {
         std::cout << "SC FIRMWARE MISMATCH, ATTENTION" << std::endl;
         std::cout << "SC firmware running on board: " << sc_ver << ". Expected SC firmware from installed Shell: " << exp_sc_ver << std::endl;
@@ -1258,7 +1298,7 @@ int xcldev::device::pcieLinkTest(void)
     return 0;
 }
 
-int xcldev::device::auxConnectionTest(void) 
+int xcldev::device::auxConnectionTest(void)
 {
     std::string name, errmsg;
     unsigned short max_power = 0;
@@ -1339,13 +1379,32 @@ int xcldev::device::getXclbinuuid(uuid_t &uuid) {
 
     return 0;
 }
+
+int xcldev::device::kernelVersionTest(void) 
+{
+    if (getenv_or_null("INTERNAL_BUILD")) {
+        std::cout << "Developer's build. Skipping validation" << std::endl;
+        return -EOPNOTSUPP;
+    }
+    if (!is_supported_kernel_version(std::cout)) {
+        return  1;
+    }
+    return 0;
+}
+
 /*
  * validate
  */
-int xcldev::device::validate(bool quick)
+int xcldev::device::validate(bool quick, bool hidden)
 {
     bool withWarning = false;
     int retVal = 0;
+
+    retVal = runOneTest("Kernel version check",
+            std::bind(&xcldev::device::kernelVersionTest, this));
+    withWarning = withWarning || (retVal == 1);
+    if (retVal < 0)
+        return retVal;
 
     retVal = runOneTest("AUX power connector check",
             std::bind(&xcldev::device::auxConnectionTest, this));
@@ -1377,6 +1436,15 @@ int xcldev::device::validate(bool quick)
     // Skip the rest of test cases for quicker turn around.
     if (quick)
         return withWarning ? 1 : 0;
+
+    // Perform IOPS test
+    if(hidden) {
+        retVal = runOneTest("IOPS test",
+            std::bind(&xcldev::device::iopsTest, this));
+        withWarning = withWarning || (retVal == 1);
+        if (retVal < 0)
+            return retVal;
+    }
 
     // Perform DMA test
     retVal = runOneTest("DMA test",
@@ -1415,8 +1483,9 @@ int xcldev::xclValidate(int argc, char *argv[])
     const std::string usage("Options: [-d index]");
     int c;
     bool quick = false;
+    bool hidden = false;
 
-    while ((c = getopt(argc, argv, "d:q")) != -1) {
+    while ((c = getopt(argc, argv, "d:qh")) != -1) {
         switch (c) {
         case 'd': {
             int ret = str2index(optarg, index);
@@ -1426,6 +1495,9 @@ int xcldev::xclValidate(int argc, char *argv[])
         }
         case 'q':
             quick = true;
+            break;
+        case 'h':
+            hidden = true;
             break;
         default:
             std::cerr << usage << std::endl;
@@ -1470,7 +1542,7 @@ int xcldev::xclValidate(int argc, char *argv[])
         std::cout << std::endl << "INFO: Validating card[" << i << "]: "
             << dev->name() << std::endl;
 
-        int v = dev->validate(quick);
+        int v = dev->validate(quick, hidden);
         if (v == 1) {
             warning = true;
             std::cout << "INFO: Card[" << i << "] validated with warnings." << std::endl;
@@ -1498,7 +1570,15 @@ int xcldev::xclValidate(int argc, char *argv[])
 
 int xcldev::device::reset(xclResetKind kind)
 {
+#ifdef __GNUC__
+# pragma GCC diagnostic push
+# pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
     return xclResetDevice(m_handle, kind);
+#ifdef __GNUC__
+# pragma GCC diagnostic pop
+#endif
+    
 }
 
 static bool canProceed()
@@ -1669,7 +1749,8 @@ int xcldev::device::testP2p()
 {
     std::string errmsg, vbnv;
     std::vector<char> buf;
-    int ret = 0, p2p_enabled = 0;
+    int ret = 0;
+    int p2p_enabled;
     xclbin_lock xclbin_lock(m_handle, m_idx);
     auto dev = pcidev::get_dev(m_idx);
 
@@ -1677,7 +1758,7 @@ int xcldev::device::testP2p()
         return -EINVAL;
 
     dev->sysfs_get("rom", "VBNV", errmsg, vbnv);
-    dev->sysfs_get<int>("", "p2p_enable", errmsg, p2p_enabled, 0);
+    p2p_enabled = pcidev::check_p2p_config(dev, errmsg);
     if (p2p_enabled != 1) {
         std::cout << "P2P BAR is not enabled. Skipping validation" << std::endl;
         return -EOPNOTSUPP;
@@ -1699,7 +1780,7 @@ int xcldev::device::testP2p()
         //p2p is not supported for DDR on u280
         if(vbnv.find("_u280_") == std::string::npos)
             supList.push_back("DDR");
-        
+
         const std::string name(reinterpret_cast<const char *>(map->m_mem_data[i].m_tag));
         bool find = false;
         for (auto s : supList) {
@@ -1788,29 +1869,19 @@ int xcldev::xclP2p(int argc, char *argv[])
     }
 
     ret = d->setP2p(p2p_enable, force);
-    if (ret == ENOSPC) {
-        std::cout << "ERROR: Not enough iomem space." << std::endl;
-        std::cout << "Please check BIOS settings" << std::endl;
-    } else if (ret == EBUSY) {
-        std::cout << "Please WARM reboot to enable p2p now." << std::endl;
-    } else if (ret == ENXIO) {
-        std::cout << "ERROR: P2P is not supported on this platform"
-            << std::endl;
-    } else if (ret == 1) {
+    if (ret)
+        std::cout << "Config P2P failed" << std::endl;
+    else if (p2p_enable)
         std::cout << "P2P is enabled" << std::endl;
-    } else if (ret == 0) {
+    else
         std::cout << "P2P is disabled" << std::endl;
-    } else if (ret)
-        std::cout << "ERROR: " << strerror(std::abs(ret)) << std::endl;
 
-    return ret;
+    return 0;
 }
 
-
-
-int xcldev::device::setCma(bool enable, uint64_t sz)
+int xcldev::device::setCma(bool enable, uint64_t total_size)
 {
-    return xclCmaEnable(m_handle, enable, sz);
+    return xclCmaEnable(m_handle, enable, total_size);
 }
 
 int xcldev::xclCma(int argc, char *argv[])
@@ -1818,19 +1889,22 @@ int xcldev::xclCma(int argc, char *argv[])
     int c;
     unsigned int index = 0;
     int cma_enable = -1;
-    uint64_t huge_page_sz = 0x40000000;
+    uint64_t total_size = 0, unit_sz = 0;
     bool root = ((getuid() == 0) || (geteuid() == 0));
-    const std::string usage("Options: [-d index] --[enable|disable] --[1G]");
+    const std::string usage("Options: [-d index] --[enable|disable] --size [size M|G]");
     static struct option long_options[] = {
         {"enable", no_argument, 0, xcldev::CMA_ENABLE},
         {"disable", no_argument, 0, xcldev::CMA_DISABLE},
-        {"1G", no_argument, 0, xcldev::CMA_SIZE_1G},
-        {"2M", no_argument, 0, xcldev::CMA_SIZE_2M},
+        {"size", required_argument, nullptr, xcldev::CMA_SIZE},
         {0, 0, 0, 0}
     };
+
     int long_index, ret;
-    const char* short_options = "d"; //don't add numbers
+    const char* short_options = "d:"; //don't add numbers
     const char* exe = argv[ 0 ];
+    std::string optarg_s;
+    const char *unit = NULL;
+    size_t end = 0;
 
     while ((c = getopt_long(argc, argv, short_options, long_options,
         &long_index)) != -1) {
@@ -1846,11 +1920,22 @@ int xcldev::xclCma(int argc, char *argv[])
         case xcldev::CMA_DISABLE:
             cma_enable = 0;
             break;
-        case xcldev::CMA_SIZE_1G:
-            huge_page_sz = 0x40000000;
-            break;
-        case xcldev::CMA_SIZE_2M:
-            huge_page_sz = 0x200000;
+        case xcldev::CMA_SIZE:
+            optarg_s += optarg;
+            try {
+                total_size = std::stoll(optarg_s, &end, 0);
+            } catch (const std::exception& ex) {
+                //out of range, invalid argument ex
+                std::cout << "ERROR: Value supplied to --size option is invalid\n";
+                return -1;
+            }
+            unit = optarg_s.substr(end).c_str();
+            if (std::tolower(unit[0]) == 'm')
+                unit_sz = 1024*1024;
+            else if (std::tolower(unit[0]) == 'g')
+                unit_sz = 1024*1024*1024;
+
+            total_size *= unit_sz;
             break;
         default:
             xcldev::printHelp(exe);
@@ -1867,22 +1952,37 @@ int xcldev::xclCma(int argc, char *argv[])
         return -EINVAL;
     }
 
+    if (cma_enable && !total_size) {
+        std::cerr << usage << std::endl;
+        return -EINVAL;
+    }
+
     if (!root) {
         std::cout << "ERROR: root privileges required." << std::endl;
         return -EPERM;
     }
 
-    ret = d->setCma(cma_enable, huge_page_sz);
-    if (ret == ENOMEM) {
-        std::cout << "ERROR: No enough huge page." << std::endl;
+    /* At this moment, we have two way to collect CMA memory chunk
+     * 1. Call Kernel API
+     * 2. Huge Page MMAP
+     */
+    ret = d->setCma(cma_enable, total_size);
+    if (ret == -ENOMEM) {
+        std::cout << "ERROR: No enough HOST MEM." << std::endl;
         std::cout << "Please check grub settings" << std::endl;
-    } else if (ret == EINVAL) {
-        std::cout << "ERROR: Invalid huge page." << std::endl;
-    } else if (ret == ENXIO) {
+    } else if (ret == -EINVAL) {
+        std::cout << "ERROR: Invalid HOST MEM size." << std::endl;
+    } else if (ret == -ENXIO) {
         std::cout << "ERROR: Huge page is not supported on this platform"
             << std::endl;
+    } else if (ret == -ENODEV) {
+        std::cout << "ERROR: Does not support HOST MEM feature"
+            << std::endl; 
+    } else if (ret == -EBUSY) {
+        std::cout << "ERROR: HOST MEM already enabled or in-use"
+            << std::endl;
     } else if (!ret) {
-        std::cout << "xbutil cma done successfully" << std::endl;
+        std::cout << "xbutil host_mem done successfully" << std::endl;
     } else if (ret) {
         std::cout << "ERROR: " << strerror(std::abs(ret)) << std::endl;
     }
@@ -1990,7 +2090,7 @@ int xcldev::device::testM2m()
 
     dev->sysfs_get<int>("mb_scheduler", "kds_numcdmas", errmsg, m2m_enabled, 0);
     // Workaround:
-    // u250_xdma_201830_1 falsely shows that m2m is available 
+    // u250_xdma_201830_1 falsely shows that m2m is available
     // which causes a hang. Skip m2mtest if this platform is installed
     dev->sysfs_get( "rom", "VBNV", errmsg, vbnv );
     if (m2m_enabled == 0 || strstr( vbnv.c_str(), "_u250_xdma_201830_1")) {
@@ -2029,4 +2129,186 @@ int xcldev::device::testM2m()
         }
     }
     return ret;
+}
+
+/*
+ * iops test
+ */
+struct exec_struct {
+    unsigned out_bo_handle;
+    char* output_bo_ptr;
+    unsigned int out_size;
+    unsigned exec_bo_handle;
+    ert_start_kernel_cmd* exec_bo_ptr;
+    unsigned int exec_size;
+};
+
+static int
+get_first_used_mem(unsigned int idx)
+{
+    std::string errmsg;
+    std::vector<char> buf;
+    auto dev = pcidev::get_dev(idx);
+    int first_used_mem = -1;
+
+    if (dev == nullptr)
+        return -EINVAL;
+
+    dev->sysfs_get("icap", "mem_topology", errmsg, buf);
+
+    const mem_topology *map = (mem_topology *)buf.data();
+    if (buf.empty() || map->m_count == 0) {
+        std::cout << "WARNING: 'mem_topology' invalid, "
+            << "unable to perform IOPS Test. Has the bitstream been loaded? "
+            << "See 'xbutil program'." << std::endl;
+        return -EINVAL;
+    }
+    for (int i = 0; i < map->m_count; i++) {
+        if (map->m_mem_data[i].m_used) {
+            first_used_mem = i;
+            break;
+        }
+    }
+    return first_used_mem;
+}
+
+static void
+iops_free_unmap_bo(xclDeviceHandle handle, unsigned boh,
+    void * boptr, size_t boSize)
+{
+    if(boptr != nullptr)
+        munmap(boptr, boSize);
+    if(boh != NULLBO)
+        xclFreeBO(handle, boh);
+}
+
+static void
+iops_alloc_init_bo(xclDeviceHandle handle, int bank, exec_struct* info)
+{
+    info->out_size = 20;
+    info->exec_size = 4096;
+    info->out_bo_handle = xclAllocBO(handle, info->out_size, 0, bank);
+    if (info->out_bo_handle == NULLBO)
+        throw std::runtime_error("Cannot obtain BO handle");
+
+    info->output_bo_ptr = reinterpret_cast<char *>(xclMapBO(handle, info->out_bo_handle, true));
+    if (info->output_bo_ptr == nullptr) {
+        iops_free_unmap_bo(handle, info->out_bo_handle, info->output_bo_ptr, info->out_size);
+        throw std::runtime_error("Cannot obtain output BO");
+    }
+
+    memset(info->output_bo_ptr, 'o', info->out_size);
+    if(xclSyncBO(handle, info->out_bo_handle, XCL_BO_SYNC_BO_TO_DEVICE, info->out_size, 0)) {
+        iops_free_unmap_bo(handle, info->out_bo_handle, info->output_bo_ptr, info->out_size);
+        throw std::runtime_error("Cannot sync output BO to device");
+    }
+
+    xclBOProperties prop;
+    if(xclGetBOProperties(handle, info->out_bo_handle, &prop)) {
+        iops_free_unmap_bo(handle, info->exec_bo_handle, info->exec_bo_ptr, info->exec_size);
+        throw std::runtime_error("Cannot obtain BO dev address");
+    }
+    uint64_t boh_address = prop.paddr;
+
+    info->exec_bo_handle = xclAllocBO(handle, info->exec_size, 0, XCL_BO_FLAGS_EXECBUF);
+    info->exec_bo_ptr = reinterpret_cast<ert_start_kernel_cmd *>(xclMapBO(handle, info->exec_bo_handle, true));
+    if (info->exec_bo_ptr == nullptr) {
+        iops_free_unmap_bo(handle, info->exec_bo_handle, info->exec_bo_ptr, info->exec_size);
+        throw std::runtime_error("Cannot obtain exec buf BO");
+    }
+    std::memset(info->exec_bo_ptr, 0, info->exec_size);
+
+    //construct the exec buffer cmd to start the kernel.
+    int rsz = 19; // regmap array size
+    info->exec_bo_ptr->state = 0;
+    info->exec_bo_ptr->opcode = ERT_START_CU;
+    info->exec_bo_ptr->count = rsz;
+    info->exec_bo_ptr->cu_mask = (0x1 << 0);
+    info->exec_bo_ptr->data[rsz - 3] = boh_address;
+    info->exec_bo_ptr->data[rsz - 2] = (boh_address >> 32);
+}
+
+static void
+execute_cmds(xclDeviceHandle handle, std::vector<std::shared_ptr<exec_struct>>& cmds,
+    double& duration)
+{
+    auto start = std::chrono::high_resolution_clock::now();
+    for (auto& c : cmds) {
+        if(xclExecBuf(handle, c->exec_bo_handle))
+            throw std::runtime_error("Unable to issue exec buf");
+    }
+    for (auto& c : cmds) {
+        // c->wait();
+        while (c->exec_bo_ptr->state < ERT_CMD_STATE_COMPLETED) {
+            while (xclExecWait(handle, -1) == 0);
+        }
+        if(c->exec_bo_ptr->state != ERT_CMD_STATE_COMPLETED)
+            throw std::runtime_error("CU execution failed");
+    }
+    auto end = std::chrono::high_resolution_clock::now();
+    duration = (std::chrono::duration_cast<std::chrono::microseconds>
+    (end - start)).count();
+}
+
+static void
+run_iops_test(xclDeviceHandle handle, std::vector<std::shared_ptr<exec_struct>>& cmds,
+    std::vector<double>& iops_list, int first_used_mem, unsigned int cmd_per_batch)
+{
+    double duration = 0;
+    double total = 0;
+    for (unsigned int i = 0; i < cmd_per_batch; i++) {
+        exec_struct info = {0};
+        iops_alloc_init_bo(handle, first_used_mem, &info);
+        auto p = std::make_shared<exec_struct>(info);
+        cmds.push_back(p);
+    }
+
+    // Execute the cmds 5 times and get average duration
+    for (int i = 0; i < 5; i++) {
+        execute_cmds(handle, cmds, duration);
+        total += duration;
+    }
+    duration = total / 5.0;
+
+    //verify
+    for(auto& c : cmds) {
+        if(xclSyncBO(handle, c->out_bo_handle, XCL_BO_SYNC_BO_FROM_DEVICE, c->out_size, 0))
+            throw std::runtime_error("Cannot sync output BO from device");
+        if (strncmp(c->output_bo_ptr, "Hello World", 11))
+            throw std::runtime_error("Bad output result after CU execution");
+    }
+    iops_list.push_back(cmds.size() * 1000 * 1000 / duration);
+    std::cout << "Commands: " << cmds.size() << " iops: " << (cmds.size() * 1000 * 1000 / duration) << std::endl;
+}
+
+int
+xcldev::device::iopsTest()
+{
+
+    xclbin_lock xclbin_lock(m_handle, m_idx);
+    int first_used_mem = get_first_used_mem(m_idx);
+
+    if(first_used_mem == -1)
+        return -EINVAL;
+
+    std::vector<std::shared_ptr<exec_struct>> cmds;
+    std::vector<unsigned int> cmd_per_batch = { 10,40,50,900,1000,2000,3000,4000,5000,10000 }; //b
+    std::vector<double> iops_list;
+
+    if(xclOpenContext(m_handle, xclbin_lock.m_uuid, 0, true))
+            throw std::runtime_error("Cannot create context");
+
+    //run different combinations
+    for(const auto& b : cmd_per_batch) {
+        run_iops_test(m_handle, cmds, iops_list, first_used_mem, b);
+    }
+
+    // release all BOs
+    for(auto& c : cmds) {
+        iops_free_unmap_bo(m_handle, c->out_bo_handle, c->output_bo_ptr, c->out_size);
+        iops_free_unmap_bo(m_handle, c->exec_bo_handle, c->exec_bo_ptr, c->exec_size);
+    }
+
+    xclCloseContext(m_handle, xclbin_lock.m_uuid, 0);
+    return 0;
 }

@@ -106,18 +106,18 @@ struct sysfs_fcn<std::vector<VectorValueType>>
 template <typename QueryRequestType>
 struct sysfs_getter : QueryRequestType
 {
-  const char* entry;
   const char* subdev;
+  const char* entry;
 
-  sysfs_getter(const char* e, const char* s)
-    : entry(e), subdev(s)
+  sysfs_getter(const char* s, const char* e)
+    : subdev(s), entry(e)
   {}
 
   boost::any
   get(const xrt_core::device* device) const
   {
     return sysfs_fcn<typename QueryRequestType::result_type>
-      ::get(get_pcidev(device), entry, subdev);
+      ::get(get_pcidev(device), subdev, entry);
   }
 };
 
@@ -136,10 +136,10 @@ static std::map<xrt_core::query::key_type, std::unique_ptr<query::request>> quer
 
 template <typename QueryRequestType>
 static void
-emplace_sysfs_request(const char* entry, const char* subdev)
+emplace_sysfs_request(const char* subdev, const char* entry)
 {
   auto x = QueryRequestType::key;
-  query_tbl.emplace(x, std::make_unique<sysfs_getter<QueryRequestType>>(entry, subdev));
+  query_tbl.emplace(x, std::make_unique<sysfs_getter<QueryRequestType>>(subdev, entry));
 }
 
 template <typename QueryRequestType, typename Getter>
@@ -161,15 +161,16 @@ initialize_query_table()
   emplace_sysfs_request<query::pcie_express_lane_width>   ("", "link_width");
   emplace_sysfs_request<query::dma_threads_raw>           ("dma", "channel_stat_raw");
   emplace_sysfs_request<query::rom_vbnv>                  ("rom", "VBNV");
-  emplace_sysfs_request<query::rom_ddr_bank_size>         ("rom", "ddr_bank_size");
+  emplace_sysfs_request<query::rom_ddr_bank_size_gb>      ("rom", "ddr_bank_size");
   emplace_sysfs_request<query::rom_ddr_bank_count_max>    ("rom", "ddr_bank_count_max");
   emplace_sysfs_request<query::rom_fpga_name>             ("rom", "FPGA");
   emplace_sysfs_request<query::rom_raw>                   ("rom", "raw");
   emplace_sysfs_request<query::rom_uuid>                  ("rom", "uuid");
   emplace_sysfs_request<query::rom_time_since_epoch>      ("rom", "timestamp");
+  emplace_sysfs_request<query::xclbin_uuid>               ("", "xclbinuuid");
   emplace_sysfs_request<query::mem_topology_raw>          ("icap", "mem_topology");
   emplace_sysfs_request<query::ip_layout_raw>             ("icap", "ip_layout");
-  emplace_sysfs_request<query::clock_freqs>               ("icap", "clock_freqs");
+  emplace_sysfs_request<query::clock_freqs_mhz>           ("icap", "clock_freqs");
   emplace_sysfs_request<query::idcode>                    ("icap", "idcode");
   emplace_sysfs_request<query::status_mig_calibrated>     ("", "mig_calibration");
   emplace_sysfs_request<query::xmc_version>               ("xmc", "version");
@@ -179,7 +180,7 @@ initialize_query_table()
   emplace_sysfs_request<query::xmc_status>                ("xmc", "status");
   emplace_sysfs_request<query::xmc_reg_base>              ("xmc", "reg_base");
   emplace_sysfs_request<query::dna_serial_num>            ("dna", "dna");
-  emplace_sysfs_request<query::status_p2p_enabled>        ("", "p2p_enable");
+  emplace_sysfs_request<query::status_p2p_enabled>        ("p2p", "p2p_enable");
   emplace_sysfs_request<query::temp_card_top_front>       ("xmc", "xmc_se98_temp0");
   emplace_sysfs_request<query::temp_card_top_rear>        ("xmc", "xmc_se98_temp1");
   emplace_sysfs_request<query::temp_card_bottom_front>    ("xmc", "xmc_se98_temp2");
@@ -241,6 +242,9 @@ initialize_query_table()
   emplace_sysfs_request<query::f_flash_type>              ("flash", "flash_type");
   emplace_sysfs_request<query::flash_type>                ("", "flash_type");
   emplace_sysfs_request<query::board_name>                ("", "board_name");
+  emplace_sysfs_request<query::logic_uuids>               ("", "logic_uuids");
+  emplace_sysfs_request<query::interface_uuids>           ("", "interface_uuids");
+
   emplace_func0_request<query::pcie_bdf,                  bdf>();
 }
 
@@ -257,25 +261,15 @@ lookup_query(query::key_type query_key) const
 {
   auto it = query_tbl.find(query_key);
 
-  if (it == query_tbl.end()) {
-    using qtype = std::underlying_type<query::key_type>::type;
-    std::string err = boost::str( boost::format("The given query request ID (%d) is not supported on Linux.")
-                                  % static_cast<qtype>(query_key));
-    throw std::runtime_error(err);
-  }
+  if (it == query_tbl.end())
+    throw query::no_such_key(query_key);
 
   return *(it->second);
 }
 
 device_linux::
-device_linux(id_type device_id, bool user)
-  : shim<device_pcie>(device_id, user)
-{
-}
-
-device_linux::
-device_linux(handle_type device_handle, id_type device_id)
-  : shim<device_pcie>(device_handle, device_id)
+device_linux(handle_type device_handle, id_type device_id, bool user)
+  : shim<device_pcie>(device_handle, device_id, user)
 {
 }
 
@@ -316,6 +310,16 @@ write(uint64_t offset, const void* buf, uint64_t len) const
 {
   if (auto err = pcidev::get_dev(get_device_id(), false)->pcieBarWrite(offset, buf, len))
     throw error(err, "write failed");
+}
+
+void 
+device_linux::
+reset(const char* subdev, const char* key, const char* value) const 
+{
+  std::string err;
+  pcidev::get_dev(get_device_id(), false)->sysfs_put(subdev, key, err, value);
+  if (!err.empty())
+    throw error("reset failed");
 }
 
 int 

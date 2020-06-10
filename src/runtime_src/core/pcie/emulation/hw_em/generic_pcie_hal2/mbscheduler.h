@@ -53,6 +53,7 @@ namespace xclhwemhal2 {
       uint32_t           addr;
       uint32_t           polladdr;
       uint32_t           ctrlreg;
+      uint32_t           ap_check;
       unsigned int       done_cnt;
       unsigned int       run_cnt;
       std::queue<xocl_cmd*>         running_queue;
@@ -66,7 +67,7 @@ namespace xclhwemhal2 {
       xclemulation::drm_xocl_bo *bo;
       exec_core *exec;
       enum ert_cmd_state state;
-      unsigned int cu_idx;
+      int cu_idx;
       int slot_idx;
       /* The actual cmd object representation */
       struct ert_packet *packet;
@@ -74,7 +75,7 @@ namespace xclhwemhal2 {
       ~xocl_cmd();
   };
 
-  class exec_core 
+  class exec_core
   {
     public:
       exec_core();

@@ -27,10 +27,7 @@ namespace xrt_core {
 class device_linux : public shim<device_pcie>
 {
 public:
-  device_linux(id_type device_id, bool user);
-
-  // Open an unmanged device.  This ctor is called by xclOpen
-  device_linux(handle_type device_handle, id_type device_id);
+  device_linux(handle_type device_handle, id_type device_id, bool user);
 
   // query functions
   virtual void read_dma_stats(boost::property_tree::ptree& pt) const;
@@ -39,6 +36,7 @@ public:
   virtual void write(uint64_t addr, const void* buf, uint64_t len) const;
   virtual int  open(const std::string& subdev, int flag) const;
   virtual void close(int dev_handle) const;
+  virtual void reset(const char*, const char*, const char*) const;
 
 private:
   // Private look up function for concrete query::request

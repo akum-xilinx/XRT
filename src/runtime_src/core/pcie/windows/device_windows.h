@@ -27,10 +27,8 @@ namespace xrt_core {
 class device_windows : public shim<device_pcie>
 {
 public:
-  device_windows(id_type device_id, bool user);
-
   // Open an unmanged device.  This ctor is called by xclOpen
-  device_windows(handle_type device_handle, id_type device_id);
+  device_windows(handle_type device_handle, id_type device_id, bool user);
 
   ~device_windows();
 
@@ -53,6 +51,7 @@ public:
   virtual void write(uint64_t addr, const void* buf, uint64_t len) const;
   virtual int  open(const std::string& subdev, int flag) const;
   virtual void close(int dev_handle) const;
+  virtual void reset(const char*, const char*, const char*) const;
 
 private:
   // Private look up function for concrete query::request

@@ -20,10 +20,34 @@
  * debug action with the cl_event
  */
 #include "xocl/core/event.h"
+#include "core/common/dlfcn.h"
+#include "core/common/module_loader.h"
 #include "plugin/xdp/appdebug.h"
 
 namespace xocl {
 namespace appdebug {
+
+  void load_xdp_app_debug()
+  {
+    static xrt_core::module_loader app_debug_loader("xdp_appdebug_plugin",
+						    register_appdebug_functions,
+						    nullptr) ;
+  }
+
+  void register_appdebug_functions(void* handle)
+  {
+    typedef void (*xdpInitType)() ;
+    
+    auto initFunc = (xdpInitType)(xrt_core::dlsym(handle, "initAppDebug")) ;
+    if (!initFunc)
+    {
+      std::string errMsg = "Failed to initialize XDP application debug library, 'initAppdebug' symbol not found.\n";
+      errMsg += xrt_core::dlerror() ;
+      throw std::runtime_error(errMsg.c_str()) ;
+    }
+
+    initFunc() ;
+  }
 
 /*
  * callback functions called from within action_ lambdas

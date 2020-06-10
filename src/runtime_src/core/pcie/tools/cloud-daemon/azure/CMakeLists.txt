@@ -27,8 +27,8 @@ target_link_libraries(azure_mpd_plugin
   xrt_core_static
   xrt_coreutil_static
   uuid
-  boost_filesystem
-  boost_system
+  ${Boost_FILESYSTEM_LIBRARY}
+  ${Boost_SYSTEM_LIBRARY}
   pthread
   rt
   dl
@@ -38,7 +38,7 @@ target_link_libraries(azure_mpd_plugin
 
 install(TARGETS azure_mpd_plugin
   LIBRARY
-  DESTINATION ${XRT_INSTALL_DIR}/lib
+  DESTINATION ${XRT_INSTALL_LIB_DIR}
   COMPONENT azure
   )
 

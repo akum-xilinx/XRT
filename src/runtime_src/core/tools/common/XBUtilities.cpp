@@ -17,9 +17,12 @@
 // ------ I N C L U D E   F I L E S -------------------------------------------
 // Local - Include Files
 #include "XBUtilities.h"
+#include "core/common/error.h"
+#include "core/common/utils.h"
+#include "core/common/message.h"
+#include "common/system.h"
 
 // 3rd Party Library - Include Files
-#include "common/core_system.h"
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/tokenizer.hpp>
 #include <boost/format.hpp>
@@ -35,6 +38,7 @@ using namespace XBUtilities;
 static bool m_bVerbose = false;
 static bool m_bTrace = false;
 static bool m_disableEscapeCodes = false;
+static bool m_bShowHidden = false;
 
 
 // ------ F U N C T I O N S ---------------------------------------------------
@@ -43,27 +47,42 @@ XBUtilities::setVerbose(bool _bVerbose)
 {
   bool prevVerbose = m_bVerbose;
 
-  if ((prevVerbose == true) && (_bVerbose == false)) {
+  if ((prevVerbose == true) && (_bVerbose == false)) 
     verbose("Disabling Verbosity");
-  }
 
   m_bVerbose = _bVerbose;
 
-  if ((prevVerbose == false) && (_bVerbose == true)) {
+  if ((prevVerbose == false) && (_bVerbose == true)) 
     verbose("Enabling Verbosity");
-  }
 }
 
 void 
 XBUtilities::setTrace(bool _bTrace)
 {
-  if (_bTrace) {
+  if (_bTrace) 
     trace("Enabling Tracing");
-  } else {
+  else 
     trace("Disabling Tracing");
-  }
 
   m_bTrace = _bTrace;
+}
+
+
+void 
+XBUtilities::setShowHidden(bool _bShowHidden)
+{
+  if (_bShowHidden) 
+    trace("Hidden commands and options will be shown.");
+  else 
+    trace("Hidden commands and options will be hidden");
+
+  m_bShowHidden = _bShowHidden;
+}
+
+bool
+XBUtilities::getShowHidden()
+{
+  return m_bShowHidden;
 }
 
 void 
@@ -277,4 +296,84 @@ XBUtilities::wrap_paragraphs( const std::string & _unformattedString,
   }
 }
 
+void
+XBUtilities::collect_devices( const std::set<std::string> &_deviceBDFs,
+                              bool _inUserDomain,
+                              xrt_core::device_collection &_deviceCollection)
+{
+  // -- If the collection is empty then do nothing
+  if (_deviceBDFs.empty())
+    return;
 
+  // -- Collect all of devices if the "all" option is used...anywhere in the collection
+  if (_deviceBDFs.find("all") != _deviceBDFs.end()) {
+    xrt_core::device::id_type total = 0;
+    try {
+      // If there are no devices in the server a runtime exception is thrown in  mgmt.cpp probe()
+      total = (xrt_core::device::id_type) xrt_core::get_total_devices(_inUserDomain /*isUser*/).first;
+    } catch (...) { 
+      /* Do nothing */ 
+    }
+
+    // No devices found
+    if (total == 0)
+      return;
+
+    // Now collect the devices and add them to the collection
+    for(xrt_core::device::id_type index = 0; index < total; ++index) {
+      if(_inUserDomain)
+        _deviceCollection.push_back( xrt_core::get_userpf_device(index) );
+      else 
+        _deviceCollection.push_back( xrt_core::get_mgmtpf_device(index) );
+    }
+
+    return;
+  }
+
+  // -- Collect the devices by name
+  for (const auto & deviceBDF : _deviceBDFs) {
+  	auto index = xrt_core::utils::bdf2index(deviceBDF, _inUserDomain);         // Can throw
+    if(_inUserDomain)
+        _deviceCollection.push_back( xrt_core::get_userpf_device(index) );
+      else 
+        _deviceCollection.push_back( xrt_core::get_mgmtpf_device(index) );
+  }
+}
+
+bool 
+XBUtilities::can_proceed()
+{
+  bool proceed = false;
+  std::string input;
+
+  std::cout << "Are you sure you wish to proceed? [Y/n]: ";
+  std::getline( std::cin, input );
+
+  // Ugh, the std::transform() produces windows compiler warnings due to 
+  // conversions from 'int' to 'char' in the algorithm header file
+  boost::algorithm::to_lower(input);
+  //std::transform( input.begin(), input.end(), input.begin(), [](unsigned char c){ return std::tolower(c); });
+  //std::transform( input.begin(), input.end(), input.begin(), ::tolower);
+
+  // proceeds for "y", "Y" and no input
+  proceed = ((input.compare("y") == 0) || input.empty());
+  if (!proceed)
+    std::cout << "Action canceled." << std::endl;
+  return proceed;
+}
+
+void 
+XBUtilities::report_available_devices() 
+{
+  std::cout << "\nList of available devices:" <<std::endl;
+  xrt_core::device_collection deviceCollection;
+  collect_devices(std::set<std::string> {"all"}, false, deviceCollection);
+  for (const auto & device : deviceCollection) {
+    boost::property_tree::ptree on_board_rom_info;
+    boost::property_tree::ptree on_board_dev_info;
+    device->get_rom_info(on_board_rom_info);
+    device->get_info(on_board_dev_info);
+    std::cout << boost::format("[%s] : %s\n") % on_board_dev_info.get<std::string>("bdf", "N/A") % on_board_rom_info.get<std::string>("vbnv", "N/A");
+  }
+  std::cout << std::endl;
+}

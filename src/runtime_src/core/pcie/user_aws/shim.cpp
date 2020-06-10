@@ -29,13 +29,18 @@
                      + __GNUC_MINOR__ * 100 \
                      + __GNUC_PATCHLEVEL__)
 
-#if ((GCC_VERSION >= 40800) && !defined(__PPC64__) && !defined(__aarch64__))
+#if ((GCC_VERSION >= 40800) && !defined(__PPC64__) && !defined(__aarch64__) && !defined(__mips__))
 #define SUPPORT_ALIGNAS
 #endif
 
 #ifdef INTERNAL_TESTING
 #define ACCELERATOR_BAR        0
 #define MMAP_SIZE_USER         0x400000
+#endif
+
+#ifdef __GNUC__
+# pragma GCC diagnostic push
+# pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 #endif
 
 /* Aligning access to FPGA DRAM space to 4096 Byte */
@@ -1687,3 +1692,6 @@ int xclGetDebugProfileDeviceInfo(xclDeviceHandle handle, xclDebugProfileDeviceIn
   return 0;
 }
 
+#ifdef __GNUC__
+# pragma GCC diagnostic pop
+#endif

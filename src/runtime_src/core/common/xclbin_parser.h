@@ -25,19 +25,20 @@
 namespace xrt_core { namespace xclbin {
 
 /**
- * struct kernel_argument - 
+ * struct kernel_argument -
  */
 struct kernel_argument
 {
   static constexpr size_t no_index { std::numeric_limits<size_t>::max() };
   // numbering must match that of meta data addressQualifier
-  enum class argtype { scalar = 0, global = 1 };
-
+  enum class argtype { scalar = 0, global = 1, stream = 4 };
+  
   std::string name;
+  std::string hosttype;
   size_t index;
   size_t offset;
   size_t size;
-  argtype  type;
+  argtype type;
 };
 
 /**
@@ -51,7 +52,9 @@ struct kernel_argument
 struct softkernel_object
 {
   uint32_t ninst;
-  char *symbol_name;
+  std::string mpo_name;
+  std::string mpo_version;
+  std::string symbol_name;
   size_t size;
   char *sk_buf;
 };
@@ -83,7 +86,7 @@ struct axlf_section_type<SectionType*>
  */
 XRT_CORE_COMMON_EXPORT
 std::string
-memidx_to_name(const axlf* top, int32_t midx);
+memidx_to_name(const mem_topology* mem, int32_t midx);
 
 /**
  * get_first_used_mem() - Get the first used memory bank index
@@ -92,10 +95,21 @@ int32_t
 get_first_used_mem(const axlf* top);
 
 /**
+ * get_max_cu_size() - Compute max register map size of CUs in xclbin
+ */
+XRT_CORE_COMMON_EXPORT
+size_t
+get_max_cu_size(const char* xml_data, size_t xml_size);
+
+/**
  * get_cus() - Get sorted list of CU base addresses in xclbin.
  *
  * @encode: If true encode control protocol in lower address bit
  */
+XRT_CORE_COMMON_EXPORT
+std::vector<uint64_t>
+get_cus(const char* xml_data, size_t xml_size, bool encode=false);
+
 XRT_CORE_COMMON_EXPORT
 std::vector<uint64_t>
 get_cus(const ip_layout* ip_layout, bool encode=false);
@@ -116,10 +130,6 @@ XRT_CORE_COMMON_EXPORT
 std::vector<const ip_data*>
 get_cus(const ip_layout* ip_layout, const std::string& kname);
 
-XRT_CORE_COMMON_EXPORT
-std::vector<const ip_data*>
-get_cus(const axlf* top, const std::string& kname);
-
 /**
  * get_ip_name() - Get name of IP with specified base addr
  *
@@ -132,6 +142,10 @@ std::string
 get_ip_name(const ip_layout* ip_layout, uint64_t addr);
 
 XRT_CORE_COMMON_EXPORT
+std::string
+get_ip_name(const axlf* top, uint64_t addr);
+
+XRT_CORE_COMMON_EXPORT
 std::vector<std::pair<uint64_t, size_t>>
 get_debug_ips(const axlf* top);
 
@@ -140,11 +154,15 @@ get_debug_ips(const axlf* top);
  */
 XRT_CORE_COMMON_EXPORT
 uint32_t
-get_cu_control(const axlf* top, uint64_t cuaddr);
+get_cu_control(const ip_layout* ip_layout, uint64_t cuaddr);
 
 /**
  * get_cu_base_offset() - Get minimum base offset of all IP_KERNEL objects
  */
+XRT_CORE_COMMON_EXPORT
+uint64_t
+get_cu_base_offset(const ip_layout* ip_layout);
+
 XRT_CORE_COMMON_EXPORT
 uint64_t
 get_cu_base_offset(const axlf* top);
@@ -154,11 +172,19 @@ get_cu_base_offset(const axlf* top);
  */
 XRT_CORE_COMMON_EXPORT
 bool
+get_cuisr(const ip_layout* ip_layout);
+
+XRT_CORE_COMMON_EXPORT
+bool
 get_cuisr(const axlf* top);
 
 /**
  * get_dataflow() - Check if any kernel in xclbin is a dataflow kernel
  */
+XRT_CORE_COMMON_EXPORT
+bool
+get_dataflow(const ip_layout* ip_layout);
+
 XRT_CORE_COMMON_EXPORT
 bool
 get_dataflow(const axlf* top);
@@ -192,6 +218,18 @@ get_kernel_freq(const axlf* top);
 /**
  * get_kernel_arguments() - Get argument meta data for a kernel
  *
+ * @xml_data: XML metadata from xclbin
+ * @xml_size: Size of XML metadata from xclbin
+ * @kname : Name of kernel
+ * Return: List of argument per struct kernel_argument
+ */
+XRT_CORE_COMMON_EXPORT
+std::vector<kernel_argument>
+get_kernel_arguments(const char* xml_data, size_t xml_size, const std::string& kname);
+
+/**
+ * get_kernel_arguments() - Get argument meta data for a kernel
+ *
  * @kname : Name of kernel
  * Return: List of argument per struct kernel_argument
  */
@@ -199,7 +237,13 @@ XRT_CORE_COMMON_EXPORT
 std::vector<kernel_argument>
 get_kernel_arguments(const axlf* top, const std::string& kname);
 
-} // xclbin
-} // xrt_core
+/**
+ * is_pdi_only() - If the xclbin has only one section and is PDI
+ */
+XRT_CORE_COMMON_EXPORT
+bool
+is_pdi_only(const axlf* top);
+
+}} // xclbin, xrt_core
 
 #endif

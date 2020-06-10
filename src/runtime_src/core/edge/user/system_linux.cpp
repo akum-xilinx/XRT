@@ -69,11 +69,7 @@ void
 system_linux::
 get_xrt_info(boost::property_tree::ptree &pt)
 {
-  pt.put("version",   xrt_build_version);
-  pt.put("hash",      xrt_build_version_hash);
-  pt.put("date",      xrt_build_version_date);
-  pt.put("branch",    xrt_build_version_branch);
-  pt.put("zocl",      driver_version("zocl"));
+  pt.put("zocl", driver_version("zocl"));
 }
 
 
@@ -97,8 +93,9 @@ get_os_info(boost::property_tree::ptree &pt)
 std::pair<device::id_type, device::id_type>
 system_linux::
 get_total_devices(bool is_user) const
-{
-  return std::make_pair(0,0);
+{ 
+  device::id_type num = xclProbe();
+  return std::make_pair(num, num); 
 }
 
 void
@@ -114,8 +111,7 @@ std::shared_ptr<device>
 system_linux::
 get_userpf_device(device::id_type id) const
 {
-  // deliberately not using std::make_shared (used with weak_ptr)
-  return std::shared_ptr<device_linux>(new device_linux(id,true));
+  return xrt_core::get_userpf_device(xclOpen(id, nullptr, XCL_QUIET));
 }
 
 std::shared_ptr<device>
@@ -123,7 +119,7 @@ system_linux::
 get_userpf_device(device::handle_type handle, device::id_type id) const
 {
   // deliberately not using std::make_shared (used with weak_ptr)
-  return std::shared_ptr<device_linux>(new device_linux(handle, id));
+  return std::shared_ptr<device_linux>(new device_linux(handle, id, true));
 }  
 
 std::shared_ptr<device>
@@ -131,7 +127,7 @@ system_linux::
 get_mgmtpf_device(device::id_type id) const
 {
   // deliberately not using std::make_shared (used with weak_ptr)
-  return std::shared_ptr<device_linux>(new device_linux(id,false));
+  return std::shared_ptr<device_linux>(new device_linux(nullptr, id, false));
 }
 
 namespace edge_linux {

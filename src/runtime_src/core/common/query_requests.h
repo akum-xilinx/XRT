@@ -22,6 +22,7 @@
 #include <vector>
 #include <sstream>
 #include <iomanip>
+#include <stdexcept>
 #include <boost/any.hpp>
 #include <boost/format.hpp>
 
@@ -50,16 +51,19 @@ enum class key_type
   pcie_express_lane_width,
   pcie_bdf,
 
+  edge_vendor,
+
   dma_threads_raw,
 
   rom_vbnv,
-  rom_ddr_bank_size,
+  rom_ddr_bank_size_gb,
   rom_ddr_bank_count_max,
   rom_fpga_name,
   rom_raw,
   rom_uuid,
   rom_time_since_epoch,
 
+  xclbin_uuid,
   mem_topology_raw,
   ip_layout_raw,
 
@@ -71,7 +75,7 @@ enum class key_type
   xmc_reg_base,
 
   dna_serial_num,
-  clock_freqs,
+  clock_freqs_mhz,
   idcode,
 
   status_mig_calibrated,
@@ -141,7 +145,36 @@ enum class key_type
   is_mfg,
   f_flash_type,
   flash_type,
-  board_name
+  board_name,
+  interface_uuids,
+  logic_uuids
+
+};
+
+class no_such_key : public std::exception
+{
+  key_type m_key;
+  std::string msg;
+
+  using qtype = std::underlying_type<query::key_type>::type;
+public:
+  explicit
+  no_such_key(key_type k)
+    : m_key(k)
+    , msg(boost::str(boost::format("No such query request (%d)") % static_cast<qtype>(k)))
+  {}
+
+  key_type
+  get_key() const
+  {
+    return m_key;
+  }
+
+  const char*
+  what() const noexcept
+  {
+    return msg.c_str();
+  }
 };
 
 struct format
@@ -268,6 +301,7 @@ struct pcie_bdf : request
 {
   using result_type = std::tuple<uint16_t,uint16_t,uint16_t>;
   static const key_type key = key_type::pcie_bdf;
+  static const char* name() { return "bdf"; }
 
   virtual boost::any
   get(const device*) const = 0;
@@ -278,6 +312,22 @@ struct pcie_bdf : request
     return boost::str
       (boost::format("%04x:%02x:%02x.%01x") % 0 % std::get<0>(value)
        % std::get<1>(value) % std::get<2>(value));
+  }
+};
+
+struct edge_vendor : request
+{
+  using result_type = uint16_t;
+  static const key_type key = key_type::edge_vendor;
+  static const char* name() { return "vendor"; }
+
+  virtual boost::any
+    get(const device*) const = 0;
+
+  static std::string
+    to_string(result_type val)
+  {
+    return boost::str(boost::format("0x%x") % val);
   }
 };
 
@@ -314,10 +364,10 @@ struct rom_vbnv : request
   }
 };
 
-struct rom_ddr_bank_size : request
+struct rom_ddr_bank_size_gb : request
 {
   using result_type = uint64_t;
-  static const key_type key = key_type::rom_ddr_bank_size;
+  static const key_type key = key_type::rom_ddr_bank_size_gb;
   static const char* name() { return "ddr_size_bytes"; }
 
   virtual boost::any
@@ -375,15 +425,72 @@ struct rom_uuid : request
 {
   using result_type = std::string;
   static const key_type key = key_type::rom_uuid;
+  static const char* name() { return "uuid"; }
 
   virtual boost::any
   get(const device*) const = 0;
+
+  static result_type
+  to_string(const result_type& value)
+  {
+    return value;
+  }
 };
 
 struct rom_time_since_epoch : request
 {
   using result_type = uint64_t;
   static const key_type key = key_type::rom_time_since_epoch;
+  static const char* name() { return "id"; }
+
+  virtual boost::any
+  get(const device*) const = 0;
+
+  static std::string
+  to_string(const result_type& value)
+  {
+    return boost::str(boost::format("0x%x") % value);
+  }
+};
+
+struct interface_uuids : request
+{
+  using result_type = std::vector<std::string>;
+  static const key_type key = key_type::interface_uuids;
+  static const char* name() { return "interface_uuids"; }
+
+  virtual boost::any
+  get(const device*) const = 0;
+
+  // formatting of individual items for the vector
+  static std::string
+  to_string(const std::string& value)
+  {
+    return value;
+  }
+};
+
+struct logic_uuids : request
+{
+  using result_type = std::vector<std::string>;
+  static const key_type key = key_type::logic_uuids;
+  static const char* name() { return "logic_uuids"; }
+
+  virtual boost::any
+  get(const device*) const = 0;
+
+  // formatting of individual items for the vector
+  static std::string
+  to_string(const std::string& value)
+  {
+    return value;
+  }
+};
+
+struct xclbin_uuid : request
+{
+  using result_type = std::string;
+  static const key_type key = key_type::xclbin_uuid;
 
   virtual boost::any
   get(const device*) const = 0;
@@ -459,7 +566,7 @@ struct xmc_bmc_version : request
 {
   using result_type = std::string;
   static const key_type key = key_type::xmc_bmc_version;
-  static const char* name() { return "satellite_controller_version"; }
+  static const char* name() { return "sc_version"; }
 
   virtual boost::any
   get(const device*) const = 0;
@@ -505,10 +612,10 @@ struct dna_serial_num : request
   }
 };
 
-struct clock_freqs : request
+struct clock_freqs_mhz : request
 {
   using result_type = std::vector<std::string> ;
-  static const key_type key = key_type::clock_freqs;
+  static const key_type key = key_type::clock_freqs_mhz;
   static const char* name() { return "clocks"; }
 
   virtual boost::any
@@ -1324,9 +1431,16 @@ struct flash_type : request
 {
   using result_type = std::string;
   static const key_type key = key_type::flash_type;
+  static const char* name() { return "flash_type"; }
 
   virtual boost::any
   get(const device*) const = 0;
+  
+  static std::string
+  to_string(result_type value)
+  {
+    return value;
+  }
 };
 
 struct board_name : request

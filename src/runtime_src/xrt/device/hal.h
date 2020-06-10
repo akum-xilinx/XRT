@@ -18,7 +18,6 @@
 #define xrt_device_hal_h
 
 #include "xrt/config.h"
-#include "xrt/device/PMDOperations.h"
 #include "xrt/util/task.h"
 #include "xrt/util/event.h"
 #include "xrt/util/range.h"
@@ -71,8 +70,6 @@ enum class queue_type : unsigned short
  ,max=3
 };
 
-//typedef rte_mbuf * PacketObject;
-typedef void* PacketObject;
 typedef uint64_t StreamHandle;
 typedef void*    StreamBuf;
 typedef uint64_t StreamBufHandle;
@@ -82,6 +79,7 @@ typedef uint64_t StreamFlags;
 
 using StreamXferReq = stream_xfer_req;
 using StreamXferCompletions = streams_poll_req_completions;
+using StreamOptType = stream_opt_type;
 /**
  * Helper class to encapsulate return values from HAL operations.
  *
@@ -154,9 +152,6 @@ public:
   {
     XRT_DEVICE_RAM
     ,XRT_DEVICE_BRAM
-#ifdef PMD_OCL
-    ,XRT_DEVICE_REGISTER
-#endif
     ,XRT_DEVICE_PREALLOCATED_BRAM
     ,XRT_SHARED_VIRTUAL
     ,XRT_SHARED_PHYSICAL
@@ -166,7 +161,7 @@ public:
   };
 
   virtual bool
-  open(const char* log, verbosity_level l) = 0;
+  open() = 0;
 
   virtual void
   close() = 0;
@@ -182,11 +177,6 @@ public:
 
   virtual void
   release_cu_context(const uuid& uuid,size_t cuidx) {}
-
-  // Hack to copy hw_em device info to sw_em device info
-  // Should not be necessary when we move to sw_emu
-  virtual void
-  copyDeviceInfo(const device* src) {}
 
   virtual std::string
   getDriverLibraryName() const = 0;
@@ -318,6 +308,13 @@ public:
   virtual int
   pollStreams(StreamXferCompletions* comps, int min, int max, int* actual, int timeout) = 0;
 
+  virtual int
+  pollStream(hal::StreamHandle stream, StreamXferCompletions* comps, int min, int max, int* actual, int timeout) = 0;
+
+  virtual int
+  setStreamOpt(hal::StreamHandle stream, int type, uint32_t val) = 0;
+
+
 public:
   /**
    * @returns
@@ -417,22 +414,6 @@ public:
   {
     return operations_result<int>();  // invalid result
   }
-
-  /**
-   * Load a bistream from a file
-   *
-   * @param fnm
-   *   Full path to bitsream file
-   * @returns
-   *   A pair <int,bool> where bool is set to true if
-   *   and only if the return int value is valid. The
-   *   return value is implementation dependent.
-   */
-//  virtual operations_result<int>
-//  loadBitstream(const char* fnm)
-//  {
-//    return operations_result<int>(); // invalid result
-//  }
 
   /**
    * Check if bank allocation is supported
@@ -685,6 +666,12 @@ public:
     return operations_result<int>();
   }
 
+  virtual operations_result<void>
+  getDebugIpLayout(char* buffer, size_t size, size_t* size_ret)
+  {
+    return operations_result<void>();
+  }
+
   virtual task::queue*
   getQueue(hal::queue_type qt) {return nullptr; }
 
@@ -710,17 +697,6 @@ XRT_EXPORT
 void
 load_xdp();
 
-XRT_EXPORT
-void
-load_xdp_kernel_debug();
-
-XRT_EXPORT
-void
-load_xdp_app_debug();
-
-XRT_EXPORT
-void
-load_xdp_lop();
 } // namespace hal
 
 namespace hal2 {
@@ -736,10 +712,9 @@ namespace hal2 {
  *   Handle to the dll as was returned by dlopen
  * @param count
  *   Number of devices probed by the dll
- * @param pmd (optional)
  */
 void
-createDevices(hal::device_list&,const std::string&,void*,unsigned int,void* pmd=nullptr);
+createDevices(hal::device_list&,const std::string&,void*,unsigned int);
 
 } // namespace hal2
 

@@ -18,6 +18,7 @@
  * License for the specific language governing permissions and limitations
  * under the License.
  */
+
 #include "shim.h"
 #include "scan.h"
 #include "system_linux.h"
@@ -48,6 +49,7 @@
 #include <cstdio>
 #include <cstdarg>
 #include <cerrno>
+#include <condition_variable>
 
 #include <unistd.h>
 #include <poll.h>
@@ -74,20 +76,12 @@
 
 #define SHIM_QDMA_AIO_EVT_MAX   1024 * 64
 
-
 // Profiling
 #define AXI_FIFO_RDFD_AXI_FULL          0x1000
 #define MAX_TRACE_NUMBER_SAMPLES                        16384
 #define XPAR_AXI_PERF_MON_0_TRACE_WORD_WIDTH            64
 
 namespace {
-
-inline bool
-is_multiprocess_mode()
-{
-  static bool val = std::getenv("XCL_MULTIPROCESS_MODE") != nullptr;
-  return val;
-}
 
 /*
  * numClocks()
@@ -123,16 +117,416 @@ inline int io_getevents(aio_context_t ctx, long min_nr, long max_nr,
 namespace xocl {
 
 /*
+ * queue_cb: A per queue control block for a qdma stream queue.
+ * queue_cb keeps track of * per-queue i/o related configurations. And it
+ * handles the actual interaction with the kernel on the i/o data path.
+ *
+ * Configuration:
+ * - qAioEn:		per queue aio context enabled or not
+ * - qAioCtx:		per queue aio context, valid only if qAioEn = true
+ * - set_option():	optional configurations for aio context and batching
+ *
+ * i/o data path:
+ * - queue_submit_io(): format & submit i/o to the kernel driver
+ * - queue_poll_completion(): polliing for completion event for asynchronously
+ * 			submitted i/o requests, valid only if qAioEn = true
+ */
+
+class queue_cb {
+private:
+    struct queued_io {	/* batching: io representation */
+       unsigned long flags;		/* flags from the original wr */
+       unsigned long priv_data; 	/* priv_data from the original wr */
+       unsigned long buf_va;		/* i/o buffer virutal address */
+       unsigned long len;		/* i/o buffer length */
+       struct iocb cb;			/* used for io_submit */
+       struct iovec iov[2];		/* used for io_submit */
+       struct xocl_qdma_req_header header;	/* used for io_submit */
+    };
+
+    bool qAioEn;		/* per queue aio is enabled */
+    bool qAioBatchEn;		/* per queue aio req. batching is enabled */
+    bool qExit;			/* queue is being stopped/released */
+    bool h2c; 			/* queue is for H2C direction */
+    uint64_t qhndl;		/* queue handle */
+    unsigned int aio_max_evts;	/* for io_setup() max. event concurrently */
+
+    /* aio batching threshold to flush the queued i/o */
+    unsigned int byteThresh;	/* total bytes count */
+    unsigned int pktThresh;	/* total buffer/packet count */
+
+    unsigned int byteCnt;	/* total bytes of queued i/o */
+    unsigned int bufCnt;	/* total buffer count of queued i/o */
+    unsigned int cbSubmitCnt;	/* total # submitted i/o */
+    unsigned int cbPollCnt;	/* total # of polled/completed i/o */
+    int cbErrCnt;		/* submission error */
+    int cbErrCode;		/* submission error code */
+
+    aio_context_t qAioCtx;	/* per queue aio context */
+
+    std::thread qWorker;	/* aio batching thread */
+    std::mutex reqLock;		/* lock to protect i/o related info. */
+    std::list<struct queued_io> reqList; /* queued up i/o request */
+    std::condition_variable cv; /* for wait/wake up the batching thread */
+
+    /* release queued i/o and update the stats */
+    int release_request(int count)
+    {
+        /* calling function should hold the reqLock */
+        int i = 0;
+        while (i < count && !(reqList.empty())) {
+            auto it = reqList.begin();
+            auto qio = (*it);
+
+	    i++;
+            bufCnt--;
+            byteCnt -= qio.len;
+            reqList.pop_front();
+        }
+
+        return i;
+    }
+
+    int queue_up_request(xclQueueRequest *wr)
+    {
+        std::lock_guard<std::mutex> lk(reqLock);
+
+        /* if there was io submission error, wait till all requests are
+         * drained or list full*/
+        if (cbErrCnt || (reqList.size() == aio_max_evts))
+            return -EAGAIN;
+
+        /* queue up this async i/o request */
+        unsigned int bytes = 0;
+        for (unsigned int i = 0; i < wr->buf_num; i++) {
+             bytes += wr->bufs[i].len;
+             reqList.push_back({wr->flag, (uint64_t)wr->priv_data,
+				wr->bufs[i].va, wr->bufs[i].len});
+        }
+        bufCnt += wr->buf_num;
+        byteCnt += bytes;
+
+	/* wake up the batch worker thread if threshold is reached */
+        if ((pktThresh && bufCnt >= pktThresh) ||
+            (byteThresh && byteCnt >= byteThresh))
+            cv.notify_one();
+
+        return wr->buf_num;
+    }
+
+    int check_io_submission_error(int nr_comps, struct xclReqCompletion *comps)
+    {
+        std::lock_guard<std::mutex> lk(reqLock);
+
+        /* no io submission error or more pending i/o requests */
+        if (!cbErrCnt || (cbSubmitCnt != cbPollCnt))
+            return 0;
+
+        int num_evt = (cbErrCnt <= nr_comps) ? cbErrCnt : nr_comps;
+        cbErrCnt -= num_evt;
+
+        int i = 0;
+        auto end = reqList.end();
+        for (auto it = reqList.begin(); it != end && i < num_evt; ++it, i++) {
+            comps[i].nbytes = 0;
+            comps[i].err_code = cbErrCode;
+            comps[i].priv_data = (void *)(*it).priv_data;
+        }
+
+        release_request(i);
+
+        if (!cbErrCnt)
+            cbErrCode = 0;
+
+        return num_evt;
+    }
+
+    /* prepare io submission structures */
+    void prepare_io(struct iocb *cb, struct iovec *iov,
+                    struct xocl_qdma_req_header *header,
+		    unsigned long buf_va, unsigned long buf_len,
+                    uint64_t priv_data)
+    {
+        iov[0].iov_base = header;
+        iov[0].iov_len = sizeof(struct xocl_qdma_req_header);
+        iov[1].iov_base = (void *)buf_va;
+        iov[1].iov_len = buf_len;
+
+        if (cb) {
+            memset(cb, 0, sizeof(struct iocb));
+            cb->aio_fildes = (int)qhndl;
+            cb->aio_lio_opcode = h2c ? IOCB_CMD_PWRITEV : IOCB_CMD_PREADV;
+            cb->aio_buf = (uint64_t)iov;
+            cb->aio_offset = 0;
+            cb->aio_nbytes = 2;
+            cb->aio_data = priv_data;
+        }
+    }
+
+    /* submit all of the queued i/o, calling function should hold the lock */
+    int queue_flush_aio_request(void)
+    {
+        /* if there is submission error, wait till all requests are drained */
+        if (cbErrCnt)
+            return -EAGAIN;
+
+        /* submit all queued requests */
+        unsigned int cb_max = bufCnt;
+        unsigned int cb_cnt = 0;
+        std::vector <struct iocb *> cbpp(cb_max);
+
+        auto end = reqList.end();
+        for (auto it = reqList.begin(); it != end && cb_cnt < cb_max;
+             ++it, cb_cnt++) {
+
+            it->header.flags = it->flags;
+            prepare_io(&it->cb, it->iov, &it->header, it->buf_va, it->len,
+			it->priv_data);
+            cbpp[cb_cnt] = &it->cb;
+        }
+
+        int submitted = io_submit(qAioCtx, cb_cnt, cbpp.data());
+        if (submitted < 0) {
+            if (submitted != -EAGAIN) {
+		/* something went wrong, flush all of the queued request with
+                 * this error */
+                cbErrCnt = reqList.size();
+                cbErrCode= submitted;
+            }
+            return submitted;
+        }
+
+        if (submitted > 0) {
+            release_request(submitted);
+            cbSubmitCnt += submitted;
+        }
+
+        return 0;
+    }
+
+    /* worker thread for aio batching */
+    void queue_aio_worker(void)
+    {
+        byteCnt = bufCnt = 0;
+
+        do {
+            std::unique_lock<std::mutex> lck(reqLock);
+	    while (reqList.empty() && !qExit)
+                cv.wait(lck);
+            queue_flush_aio_request();
+        } while(!qExit);
+
+        qAioBatchEn = false;
+    }
+
+    void stop_aio_worker(void)
+    {
+        if (qAioBatchEn) {
+            std::lock_guard<std::mutex> lk(reqLock);
+            /* stop the worker thread */
+            qExit = true;
+            cv.notify_one();
+        }
+        if (qWorker.joinable())
+            qWorker.join();
+    }
+
+    void queue_aio_batch_disable_check(void)
+    {
+        if (!byteThresh && !pktThresh)
+            stop_aio_worker();
+    }
+
+    void queue_aio_batch_enable_check(void)
+    {
+        /* to enable aio batching, the stream needs to have its own context
+         * and any of the
+         */
+        if (qAioEn && (byteThresh || pktThresh) && !qAioBatchEn) {
+            std::lock_guard<std::mutex> lk(reqLock);
+            qExit = false;
+            qWorker = std::thread(&queue_cb::queue_aio_worker, this);
+            qAioBatchEn = true;
+        }
+    }
+
+public:
+    queue_cb(struct xocl_qdma_ioc_create_queue *qinfo)
+        : qAioEn{false}, qAioBatchEn{false}, qExit{false},
+          h2c{qinfo->write ? true : false}, qhndl{qinfo->handle},
+          aio_max_evts{0}, byteThresh{0}, pktThresh{0}, byteCnt{0}, bufCnt{0},
+          cbSubmitCnt{0}, cbPollCnt{0}, cbErrCnt{0}, cbErrCode{0}
+    {
+       memset(&qAioCtx, 0, sizeof(qAioCtx));
+    }
+
+    ~queue_cb()
+    {
+        if (!qAioEn)
+           return;
+
+        stop_aio_worker();
+        io_destroy(qAioCtx);
+    }
+
+    const bool queue_aio_ctx_enabled(void) { return qAioEn; }
+    const bool queue_is_h2c(void) { return h2c; }
+    const int queue_get_handle(void) { return qhndl; }
+
+    // optional configurations
+    int set_option(int type, uint32_t val)
+    {
+        switch(type) {
+        case STREAM_OPT_AIO_MAX_EVENT:
+	    if (!qAioEn) {
+                if (!val)
+                    val = SHIM_QDMA_AIO_EVT_MAX;
+		auto rc = io_setup(val, &qAioCtx);
+		if (!rc) {
+		     qAioEn = true;
+                     aio_max_evts = val;
+                }
+                return rc;
+	    }
+            return -EINVAL;
+            /* for i/o batching */
+        case STREAM_OPT_AIO_BATCH_THRESH_BYTES:
+	    byteThresh = val;
+            if (val && qAioEn && !qAioBatchEn)
+                queue_aio_batch_enable_check();
+            else if (!val && qAioBatchEn)
+                queue_aio_batch_disable_check();
+            return 0;
+        case STREAM_OPT_AIO_BATCH_THRESH_PKTS:
+	    pktThresh = val;
+            if (val && qAioEn && !qAioBatchEn)
+                queue_aio_batch_enable_check();
+            else if (!val && qAioBatchEn)
+                queue_aio_batch_disable_check();
+            return 0;
+        default:
+            return -EINVAL;
+        }
+    }
+
+    // get aio completion event of the queue
+    int queue_poll_completion(int min_compl, int max_compl,
+                              struct xclReqCompletion *comps, int* actual,
+                              int timeout /*ms*/)
+    {
+        struct timespec time, *ptime = nullptr;
+        int num_evt;
+
+        *actual = 0;
+
+        if (timeout > 0) {
+            memset(&time, 0, sizeof(time));
+            time.tv_sec = timeout / 1000;
+            time.tv_nsec = (timeout % 1000) * 1000000;
+            ptime = &time;
+        }
+
+        int rc = io_getevents(qAioCtx, min_compl, max_compl,
+				(struct io_event *)comps, ptime);
+        if (rc < 0)
+            return rc;
+
+        cbPollCnt += rc;
+        num_evt = rc;
+        for (int i = num_evt - 1; i >= 0; i--) {
+            comps[i].priv_data = (void *)((struct io_event *)comps)[i].data;
+            if (((struct io_event *)comps)[i].res < 0){
+                /* error returned by AIO framework */
+                comps[i].nbytes = 0;
+                comps[i].err_code = ((struct io_event *)comps)[i].res;
+            } else {
+                comps[i].nbytes = ((struct io_event *)comps)[i].res;
+                comps[i].err_code = ((struct io_event *)comps)[i].res2;
+            }
+        }
+
+        if (rc < min_compl && qAioBatchEn) {
+             /* timeout happened, check if there is any io submission errors */
+             rc = check_io_submission_error(max_compl - num_evt, comps + num_evt);
+             num_evt += rc;
+        }
+
+        *actual = num_evt;
+        return 0;
+    }
+
+    // submit the read/write i/o to the queue
+    ssize_t queue_submit_io(xclQueueRequest *wr, aio_context_t *mAioCtx)
+    {
+        ssize_t rc = 0;
+        bool aio = (wr->flag & XCL_QUEUE_REQ_NONBLOCKING) ? true : false;
+
+        if (qAioBatchEn) {
+            /* queue up this async i/o request */
+            if (aio) {
+                return queue_up_request(wr);
+            } else {
+                /* this is synchronous i/o, flush all of the queued requests
+                 * first to maintain the order */
+                std::lock_guard<std::mutex> lk(reqLock);
+                while (!reqList.empty()) {
+   		    rc = queue_flush_aio_request();
+                    if (rc < 0)
+                        return rc;
+                }
+
+                /* fall through to process this request */
+                rc = 0;
+            }
+        }
+
+        /* synchronous i/o or no batching configured on the queue, submit the
+         * i/o right away */
+        struct xocl_qdma_req_header header;
+        header.flags = wr->flag;
+        if (aio) {
+            aio_context_t *aio_ctx = qAioEn ? &qAioCtx : mAioCtx;
+            for (unsigned int i = 0; i < wr->buf_num; i++) {
+                struct iovec iov[2];
+		struct iocb cb;
+		struct iocb *cbs[1] = {&cb};
+
+                prepare_io(&cb, iov, &header, wr->bufs[i].va, wr->bufs[i].len,
+			 (uint64_t)wr->priv_data);
+                int rv = io_submit(*aio_ctx, 1, cbs);
+                if (rv <= 0)
+                    break;
+                rc++;
+            }
+            std::lock_guard<std::mutex> lk(reqLock);
+            cbSubmitCnt += rc;
+        } else {
+            for (unsigned int i = 0; i < wr->buf_num; i++) {
+                struct iovec iov[2];
+                prepare_io(nullptr, iov, &header, wr->bufs[i].va, wr->bufs[i].len, 0);
+                if (h2c)
+                    rc = writev((int)qhndl, iov, 2);
+                else
+                    rc = readv((int)qhndl, iov, 2);
+
+                if (rc < 0 || (size_t)rc != wr->bufs[i].len)
+                    return rc;
+            }
+        }
+        return rc;
+    }
+
+}; /* queue_cb */
+
+/*
  * shim()
  */
-shim::shim(unsigned index, const char *logfileName, xclVerbosityLevel verbosity)
+shim::
+shim(unsigned index)
   : mCoreDevice(xrt_core::pcie_linux::get_userpf_device(this, index))
-  , mVerbosity(verbosity)
   , mUserHandle(-1)
   , mStreamHandle(-1)
   , mBoardNumber(index)
-  , mLocked(false)
-  , mLogfileName(nullptr)
   , mOffsets{0x0, 0x0, OCL_CTLR_BASE, 0x0, 0x0}
   , mMemoryProfilingNumberSlots(0)
   , mAccelProfilingNumberSlots(0)
@@ -141,7 +535,7 @@ shim::shim(unsigned index, const char *logfileName, xclVerbosityLevel verbosity)
   , mCmdBOCache(nullptr)
   , mCuMaps(128, nullptr)
 {
-    init(index, logfileName, verbosity);
+  init(index);
 }
 
 int shim::dev_init()
@@ -219,13 +613,10 @@ void shim::dev_fini()
 /*
  * init()
  */
-void shim::init(unsigned index, const char *logfileName,
-    xclVerbosityLevel verbosity)
+void
+shim::
+init(unsigned int index)
 {
-    if(logfileName != nullptr) {
-        xrt_logmsg(XRT_WARNING, "%s: logfileName is no longer supported", __func__);
-    }
-
     xrt_logmsg(XRT_INFO, "%s", __func__);
 
     int ret = dev_init();
@@ -387,8 +778,13 @@ size_t shim::xclRead(xclAddressSpace space, uint64_t offset, void *hostBuf, size
 unsigned int shim::xclAllocBO(size_t size, int unused, unsigned flags)
 {
     drm_xocl_create_bo info = {size, mNullBO, flags};
+    unsigned int bo = mNullBO;
     int result = mDev->ioctl(mUserHandle, DRM_IOCTL_XOCL_CREATE_BO, &info);
-    return result ? mNullBO : info.handle;
+    if (result)
+        errno = result;
+    else
+        bo = info.handle;
+    return bo;
 }
 
 /*
@@ -398,8 +794,13 @@ unsigned int shim::xclAllocUserPtrBO(void *userptr, size_t size, unsigned flags)
 {
     drm_xocl_userptr_bo user =
         {reinterpret_cast<uint64_t>(userptr), size, mNullBO, flags};
+    unsigned int bo = mNullBO;
     int result = mDev->ioctl(mUserHandle, DRM_IOCTL_XOCL_USERPTR_BO, &user);
-    return result ? mNullBO : user.handle;
+    if (result)
+        errno = result;
+    else
+        bo = user.handle;
+    return bo;
 }
 
 /*
@@ -728,11 +1129,24 @@ int shim::p2pEnable(bool enable, bool force)
 {
     const std::string input = "1\n";
     std::string err;
+    std::vector<std::string> p2p_cfg;
 
-    if (enable)
-        mDev->sysfs_put("", "p2p_enable", err, "1");
-    else
-        mDev->sysfs_put("", "p2p_enable", err, "0");
+    if (mDev == nullptr)
+        return -EINVAL;
+
+    /* write 0 to config for default bar size */
+    if (enable) {
+        mDev->sysfs_put("p2p", "config", err, "0");
+        if (!err.empty()) { 
+            throw std::runtime_error("P2P is not supported");
+        }
+     } else {
+        mDev->sysfs_put("p2p", "config", err, "-1");
+        if (!err.empty()) { 
+            throw std::runtime_error("P2P is not supported");
+        }
+     }
+
 
     if (force) {
         dev_fini();
@@ -750,10 +1164,17 @@ int shim::p2pEnable(bool enable, bool force)
         dev_init();
     }
 
-    int p2p_enable = EINVAL;
-    mDev->sysfs_get<int>("", "p2p_enable", err, p2p_enable, EINVAL);
+    int ret;
+    ret = check_p2p_config(mDev, err);
+    if (!err.empty()) {
+        throw std::runtime_error(err);
+    } else if (ret == P2P_CONFIG_DISABLED && enable) {
+        throw std::runtime_error("Can not enable P2P");
+    } else if (ret == P2P_CONFIG_ENABLED && !enable) {
+        throw std::runtime_error("Can not disable P2P");
+    }
 
-    return p2p_enable;
+    return 0;
 }
 
 int shim::cmaEnable(bool enable, uint64_t size)
@@ -761,42 +1182,66 @@ int shim::cmaEnable(bool enable, uint64_t size)
     int ret = 0;
 
     if (enable) {
-        uint32_t hugepage_flag = 0;
+        uint64_t page_sz = 1 << 30;
+        uint32_t page_num = size >> 30;
+        drm_xocl_alloc_cma_info cma_info = {0};
+        int err_code = 0;
 
-        drm_xocl_alloc_cma_info cma_info;
-        cma_info.page_sz = size;
+        cma_info.total_size = size;
+        cma_info.entry_num = 0;
 
-        /* Once set MAP_HUGETLB, we have to specify bit[26~31] as size in log
-         * e.g. We like to get 2M huge page, 2M = 2^21,
-         * 21 = 0x15
-         */
-        if (size == (1 << 30))
-            hugepage_flag = 0x1e;
-        else if (size == (2 << 20))
-            hugepage_flag = 0x15;
+        ret = mDev->ioctl(mUserHandle, DRM_IOCTL_XOCL_ALLOC_CMA, &cma_info);
 
-        if (!hugepage_flag)
-            return -EINVAL;
+        err_code = -errno;
+        if (ret && err_code != -E2BIG)
+            return err_code;
+        else if (err_code == -E2BIG) {
+            /* Once set MAP_HUGETLB, we have to specify bit[26~31] as size in log
+             * e.g. We like to get 2M huge page, 2M = 2^21,
+             * 21 = 0x15
+             * Let's find how many 1GB huge page we have to allocate
+             */
+            uint64_t hugepage_flag = 0x1e;
+            cma_info.entry_num = page_num;
+
+            if (size < page_sz)
+                return -EINVAL;
+
+            cma_info.user_addr = (uint64_t *)alloca(sizeof(uint64_t)*page_num);
+            ret = 0;
 
 
-        void *addr_local = mmap(0x0, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | hugepage_flag << MAP_HUGE_SHIFT, 0, 0);
-        if (addr_local == MAP_FAILED) {
-            xrt_logmsg(XRT_ERROR, "Unable to get huge page.");
-            ret = -ENOMEM;
-        } else {
-            cma_info.user_addr = (uint64_t)addr_local;
-        }
+            for (uint32_t i = 0; i < page_num; ++i) {
+                void *addr_local = mmap(0x0, page_sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | hugepage_flag << MAP_HUGE_SHIFT, 0, 0);
 
-        if (!ret) {
-            ret = mDev->ioctl(mUserHandle, DRM_IOCTL_XOCL_ALLOC_CMA, &cma_info);
-            if (ret)
-                ret = -errno;
-            munmap((void*)cma_info.user_addr, size);
+                if (addr_local == MAP_FAILED) {
+                    xrt_logmsg(XRT_ERROR, "Unable to get huge page.");
+                    ret = -ENOMEM;
+                    break;
+                } else {
+                    cma_info.user_addr[i] = (uint64_t)addr_local;
+                }
+            }
+
+            if (!ret) {
+                ret = mDev->ioctl(mUserHandle, DRM_IOCTL_XOCL_ALLOC_CMA, &cma_info);
+                if (ret)
+                        ret = -errno;
+            }
+
+            for (uint32_t i = 0; i < page_num; ++i) {
+                if (!cma_info.user_addr[i])
+                    continue;
+
+                 munmap((void*)cma_info.user_addr[i], page_sz);
+            }
+
         }
 
     } else {
-        drm_xocl_free_cma_info cma_info = {0};
-        ret = mDev->ioctl(mUserHandle, DRM_IOCTL_XOCL_FREE_CMA, &cma_info);
+        ret = mDev->ioctl(mUserHandle, DRM_IOCTL_XOCL_FREE_CMA);
+        if (ret)
+                ret = -errno;
     }
 
     return ret;
@@ -804,26 +1249,21 @@ int shim::cmaEnable(bool enable, uint64_t size)
 /*
  * xclLockDevice()
  */
-bool shim::xclLockDevice()
+bool
+shim::
+xclLockDevice()
 {
-    if (!is_multiprocess_mode() &&
-        mDev->flock(mUserHandle, LOCK_EX | LOCK_NB) == -1)
-        return false;
-
-    mLocked = true;
-    return true;
+  return true;
 }
 
 /*
  * xclUnlockDevice()
  */
-bool shim::xclUnlockDevice()
+bool
+shim::
+xclUnlockDevice()
 {
-    if (!is_multiprocess_mode())
-      mDev->flock(mUserHandle, LOCK_UN);
-
-    mLocked = false;
-    return true;
+  return true;
 }
 
 /*
@@ -870,26 +1310,28 @@ bool shim::zeroOutDDR()
  */
 int shim::xclLoadXclBin(const xclBin *buffer)
 {
-    int ret = 0;
-    const char *xclbininmemory = reinterpret_cast<char*> (const_cast<xclBin*> (buffer));
-
-    ret = xclLoadAxlf(reinterpret_cast<const axlf*>(xclbininmemory));
+    auto top = reinterpret_cast<const axlf*>(buffer);
+    auto ret = xclLoadAxlf(top);
     if (ret != 0) {
-        if (ret == -EOPNOTSUPP) {
-            xrt_logmsg(XRT_ERROR, "Xclbin does not match Shell on card.");
-            xrt_logmsg(XRT_ERROR, "Use 'xbmgmt flash' to update Shell.");
-        } else if (ret == -EBUSY) {
-            xrt_logmsg(XRT_ERROR, "Xclbin on card is in use, can't change.");
-        } else if (ret == -EKEYREJECTED) {
-            xrt_logmsg(XRT_ERROR, "Xclbin isn't signed properly");
-        } else if (ret == -ETIMEDOUT) {
-            xrt_logmsg(XRT_ERROR,
-                "Can't reach out to mgmt for xclbin downloading");
-            xrt_logmsg(XRT_ERROR,
-                "Is xclmgmt driver loaded? Or is MSD/MPD running?");
-        }
-        xrt_logmsg(XRT_ERROR, "See dmesg log for details. err=%d", ret);
+      if (ret == -EOPNOTSUPP) {
+        xrt_logmsg(XRT_ERROR, "Xclbin does not match Shell on card.");
+        xrt_logmsg(XRT_ERROR, "Use 'xbmgmt flash' to update Shell.");
+      }
+      else if (ret == -EBUSY) {
+        xrt_logmsg(XRT_ERROR, "Xclbin on card is in use, can't change.");
+      }
+      else if (ret == -EKEYREJECTED) {
+        xrt_logmsg(XRT_ERROR, "Xclbin isn't signed properly");
+      }
+      else if (ret == -ETIMEDOUT) {
+        xrt_logmsg(XRT_ERROR,
+                   "Can't reach out to mgmt for xclbin downloading");
+        xrt_logmsg(XRT_ERROR,
+                   "Is xclmgmt driver loaded? Or is MSD/MPD running?");
+      }
+      xrt_logmsg(XRT_ERROR, "See dmesg log for details. err=%d", ret);
     }
+
     return ret;
 }
 
@@ -899,11 +1341,6 @@ int shim::xclLoadXclBin(const xclBin *buffer)
 int shim::xclLoadAxlf(const axlf *buffer)
 {
     xrt_logmsg(XRT_INFO, "%s, buffer: %s", __func__, buffer);
-
-    if (!mLocked) {
-        xrt_logmsg(XRT_ERROR, "%s: Device is not locked", __func__);
-        return -EPERM;
-    }
 
     drm_xocl_axlf axlf_obj = {const_cast<axlf *>(buffer)};
     int ret = mDev->ioctl(mUserHandle, DRM_IOCTL_XOCL_READ_AXLF, &axlf_obj);
@@ -930,8 +1367,15 @@ int shim::xclLoadAxlf(const axlf *buffer)
  */
 int shim::xclExportBO(unsigned int boHandle)
 {
-    drm_prime_handle info = {boHandle, 0, -1};
+    drm_prime_handle info = {boHandle, DRM_RDWR, -1};
     int result = mDev->ioctl(mUserHandle, DRM_IOCTL_PRIME_HANDLE_TO_FD, &info);
+    if (result) {
+        xrt_logmsg(XRT_WARNING, "XRT", "%s: DRM prime handle to fd failed with DRM_RDWR. Trying default flags.", __func__);
+        info.flags = 0;
+        result = ioctl(mUserHandle, DRM_IOCTL_PRIME_HANDLE_TO_FD, &info);
+    }
+
+    xrt_logmsg(XRT_DEBUG, "XRT", "%s: boHandle %d, ioctl return %ld, fd %d", __func__, boHandle, result, info.fd);
     return !result ? info.fd : result;
 }
 
@@ -1133,6 +1577,12 @@ int shim::xclExecBuf(unsigned int cmdBO, size_t num_bo_in_wait_list, unsigned in
 {
     xrt_logmsg(XRT_INFO, "%s, cmdBO: %d, num_bo_in_wait_list: %d, bo_wait_list: %d",
             __func__, cmdBO, num_bo_in_wait_list, bo_wait_list);
+
+    if (num_bo_in_wait_list > MAX_DEPS) {
+        xrt_logmsg(XRT_ERROR, "%s, Incorrect argument. Max num of BOs in wait_list: %d",
+            __func__, MAX_DEPS);
+        return -EINVAL;
+    }
     int ret;
     unsigned int bwl[8] = {0};
     std::memcpy(bwl,bo_wait_list,num_bo_in_wait_list*sizeof(unsigned int));
@@ -1212,7 +1662,6 @@ int shim::xclBootFPGA()
 int shim::xclCreateWriteQueue(xclQueueContext *q_ctx, uint64_t *q_hdl)
 {
     struct xocl_qdma_ioc_create_queue q_info;
-    int rc;
 
     memset(&q_info, 0, sizeof (q_info));
     q_info.write = 1;
@@ -1220,13 +1669,16 @@ int shim::xclCreateWriteQueue(xclQueueContext *q_ctx, uint64_t *q_hdl)
     q_info.flowid = q_ctx->flow;
     q_info.flags = q_ctx->flags;
 
-    rc = ioctl(mStreamHandle, XOCL_QDMA_IOC_CREATE_QUEUE, &q_info);
+    int rc = ioctl(mStreamHandle, XOCL_QDMA_IOC_CREATE_QUEUE, &q_info);
     if (rc) {
         xrt_logmsg(XRT_ERROR, "%s: Create Write Queue IOCTL failed", __func__);
-    } else
-        *q_hdl = q_info.handle;
+        return -errno;
+    }
 
-     return rc ? -errno : rc;
+    queue_cb *qcb = new xocl::queue_cb(&q_info);
+    *q_hdl = reinterpret_cast<uint64_t>(qcb);
+
+    return 0;
 }
 
 /*
@@ -1235,7 +1687,6 @@ int shim::xclCreateWriteQueue(xclQueueContext *q_ctx, uint64_t *q_hdl)
 int shim::xclCreateReadQueue(xclQueueContext *q_ctx, uint64_t *q_hdl)
 {
     struct xocl_qdma_ioc_create_queue q_info;
-    int rc;
 
     memset(&q_info, 0, sizeof (q_info));
 
@@ -1243,13 +1694,16 @@ int shim::xclCreateReadQueue(xclQueueContext *q_ctx, uint64_t *q_hdl)
     q_info.flowid = q_ctx->flow;
     q_info.flags = q_ctx->flags;
 
-    rc = ioctl(mStreamHandle, XOCL_QDMA_IOC_CREATE_QUEUE, &q_info);
+    int rc = ioctl(mStreamHandle, XOCL_QDMA_IOC_CREATE_QUEUE, &q_info);
     if (rc) {
         xrt_logmsg(XRT_ERROR, "%s: Create Read Queue IOCTL failed", __func__);
-    } else
-        *q_hdl = q_info.handle;
+        return -errno;
+    }
 
-    return rc ? -errno : rc;
+    queue_cb *qcb = new xocl::queue_cb(&q_info);
+    *q_hdl = reinterpret_cast<uint64_t>(qcb);
+
+    return 0;
 }
 
 /*
@@ -1257,11 +1711,19 @@ int shim::xclCreateReadQueue(xclQueueContext *q_ctx, uint64_t *q_hdl)
  */
 int shim::xclDestroyQueue(uint64_t q_hdl)
 {
-    int rc;
+    queue_cb *qcb = reinterpret_cast<queue_cb *>(q_hdl);
+    int qfd = qcb->queue_get_handle();
 
-    rc = close((int)q_hdl);
+    int rc = ioctl(qfd, XOCL_QDMA_IOC_QUEUE_FLUSH, NULL);
+
+    if (rc)
+        xrt_logmsg(XRT_ERROR, "%s: Flush Queue failed", __func__);
+
+    rc = close(qfd);
     if (rc)
         xrt_logmsg(XRT_ERROR, "%s: Destroy Queue failed", __func__);
+
+    delete(qcb);
 
     return rc;
 }
@@ -1317,44 +1779,65 @@ int shim::xclFreeQDMABuf(uint64_t buf_hdl)
 int shim::xclPollCompletion(int min_compl, int max_compl, struct xclReqCompletion *comps, int* actual, int timeout /*ms*/)
 {
     /* TODO: populate actual and timeout args correctly */
-    struct timespec time, *ptime = NULL;
+    struct timespec time, *ptime = nullptr;
     int num_evt, i;
 
     *actual = 0;
     if (!mAioEnabled) {
-        num_evt = -EINVAL;
         xrt_logmsg(XRT_ERROR, "%s: async io is not enabled", __func__);
-        goto done;
+        throw std::runtime_error("sync io is not enabled");
     }
+
     if (timeout > 0) {
         memset(&time, 0, sizeof(time));
         time.tv_sec = timeout / 1000;
         time.tv_nsec = (timeout % 1000) * 1000000;
         ptime = &time;
     }
-
     num_evt = io_getevents(mAioContext, min_compl, max_compl, (struct io_event *)comps, ptime);
-    if (num_evt < min_compl) {
-        xrt_logmsg(XRT_ERROR, "%s: failed to poll Queue Completions", __func__);
-        goto done;
-    }
+
     *actual = num_evt;
+    if (num_evt <= 0) {
+        xrt_logmsg(XRT_DEBUG, "%s: failed to poll Queue Completions", __func__);
+        return -ETIMEDOUT;
+    }
 
     for (i = num_evt - 1; i >= 0; i--) {
         comps[i].priv_data = (void *)((struct io_event *)comps)[i].data;
-    if (((struct io_event *)comps)[i].res < 0){
+        if (((struct io_event *)comps)[i].res < 0){
             /* error returned by AIO framework */
             comps[i].nbytes = 0;
-        comps[i].err_code = ((struct io_event *)comps)[i].res;
-    } else {
+            comps[i].err_code = ((struct io_event *)comps)[i].res;
+        } else {
             comps[i].nbytes = ((struct io_event *)comps)[i].res;
-        comps[i].err_code = ((struct io_event *)comps)[i].res2;
+            comps[i].err_code = ((struct io_event *)comps)[i].res2;
+        }
     }
-    }
-    num_evt = 0;
+    return 0;
+}
 
-done:
-    return num_evt;
+/*
+ * xclPollQueue()
+ */
+int shim::xclPollQueue(uint64_t q_hdl, int min_compl, int max_compl, struct xclReqCompletion *comps, int* actual, int timeout /*ms*/)
+{
+    queue_cb *qcb = reinterpret_cast<queue_cb *>(q_hdl);
+
+    if (!qcb->queue_aio_ctx_enabled()) {
+        xrt_logmsg(XRT_ERROR, "%s: per-queue AIO is not enabled", __func__);
+        return -EINVAL;
+    }
+    return qcb->queue_poll_completion(min_compl, max_compl, comps, actual, timeout);
+}
+
+/*
+ * xclSetQueueOpt()
+ */
+int shim::xclSetQueueOpt(uint64_t q_hdl, int type, uint32_t val)
+{
+    queue_cb *qcb = reinterpret_cast<queue_cb *>(q_hdl);
+
+    return qcb->set_option(type, val);
 }
 
 /*
@@ -1362,67 +1845,30 @@ done:
  */
 ssize_t shim::xclWriteQueue(uint64_t q_hdl, xclQueueRequest *wr)
 {
-    ssize_t rc = 0;
+    queue_cb *qcb = reinterpret_cast<queue_cb *>(q_hdl);
 
-    for (unsigned i = 0; i < wr->buf_num; i++) {
-        void *buf = (void *)wr->bufs[i].va;
-        struct iovec iov[2];
-        struct xocl_qdma_req_header header;
+    if (!qcb->queue_is_h2c()) {
+        xrt_logmsg(XRT_ERROR, "%s: queue is read only", __func__);
+        return -EINVAL;
+    }
 
-        header.flags = wr->flag;
-        iov[0].iov_base = &header;
-        iov[0].iov_len = sizeof(header);
-        iov[1].iov_base = buf;
-        iov[1].iov_len = wr->bufs[i].len;
+    if ((wr->flag & XCL_QUEUE_REQ_NONBLOCKING) &&
+        !mAioEnabled && !(qcb->queue_aio_ctx_enabled())) {
+         xrt_logmsg(XRT_ERROR, "%s: NONBLOCK but aio NOT enabled.\n", __func__);
+         return -EINVAL;
+    }
 
-        if (wr->flag & XCL_QUEUE_REQ_NONBLOCKING) {
-            struct iocb cb;
-            struct iocb *cbs[1];
-
-            if (!mAioEnabled) {
-                xrt_logmsg(XRT_ERROR, "%s: async io is not enabled", __func__);
-                break;
-            }
-
-            if (!(wr->flag & XCL_QUEUE_REQ_EOT) && (wr->bufs[i].len & 0xfff)) {
-                std::cerr << "ERROR: write without EOT has to be multiple of 4k" << std::endl;
-                break;
-            }
-
-            memset(&cb, 0, sizeof(cb));
-            cb.aio_fildes = (int)q_hdl;
-            cb.aio_lio_opcode = IOCB_CMD_PWRITEV;
-            cb.aio_buf = (uint64_t)iov;
-            cb.aio_offset = 0;
-            cb.aio_nbytes = 2;
-            cb.aio_data = (uint64_t)wr->priv_data;
-
-            cbs[0] = &cb;
-            if (io_submit(mAioContext, 1, cbs) > 0)
-                rc++;
-            else {
-                std::cerr << "ERROR: async write stream failed" << std::endl;
-                break;
-            }
-        } else {
-            if (!(wr->flag & XCL_QUEUE_REQ_EOT) && (wr->bufs[i].len & 0xfff)) {
-                std::cerr << "ERROR: write without EOT has to be multiple of 4k" << std::endl;
-                rc = -EINVAL;
-                break;
-            }
-
-            rc = writev((int)q_hdl, iov, 2);
-            if (rc < 0) {
-                std::cerr << "ERROR: write stream failed: " << rc << std::endl;
-                break;
-            } else if ((size_t)rc != wr->bufs[i].len) {
-                std::cerr << "ERROR: only " << rc << "/" << wr->bufs[i].len;
-                std::cerr << " bytes is written" << std::endl;
-                break;
+    if (!(wr->flag & XCL_QUEUE_REQ_EOT)) {
+        for (unsigned i = 0; i < wr->buf_num; i++) {
+            if ((wr->bufs[i].len & 0xfff)) {
+                xrt_logmsg(XRT_ERROR, "%s: write w/o EOT len %lu != N*4K.\n",
+                                 __func__, wr->bufs[i].len);
+                return -EINVAL;
             }
         }
     }
-    return rc;
+
+    return qcb->queue_submit_io(wr, &mAioContext);
 }
 
 /*
@@ -1430,53 +1876,20 @@ ssize_t shim::xclWriteQueue(uint64_t q_hdl, xclQueueRequest *wr)
  */
 ssize_t shim::xclReadQueue(uint64_t q_hdl, xclQueueRequest *wr)
 {
-    ssize_t rc = 0;
+    queue_cb *qcb = reinterpret_cast<queue_cb *>(q_hdl);
 
-    for (unsigned i = 0; i < wr->buf_num; i++) {
-        void *buf = (void *)wr->bufs[i].va;
-        struct iovec iov[2];
-        struct xocl_qdma_req_header header;
-
-        header.flags = wr->flag;
-        iov[0].iov_base = &header;
-        iov[0].iov_len = sizeof(header);
-        iov[1].iov_base = buf;
-        iov[1].iov_len = wr->bufs[i].len;
-
-        if (wr->flag & XCL_QUEUE_REQ_NONBLOCKING) {
-            struct iocb cb;
-            struct iocb *cbs[1];
-
-            if (!mAioEnabled) {
-                xrt_logmsg(XRT_ERROR, "%s: async io is not enabled", __func__);
-                break;
-            }
-
-            memset(&cb, 0, sizeof(cb));
-            cb.aio_fildes = (int)q_hdl;
-            cb.aio_lio_opcode = IOCB_CMD_PREADV;
-            cb.aio_buf = (uint64_t)iov;
-            cb.aio_offset = 0;
-            cb.aio_nbytes = 2;
-            cb.aio_data = (uint64_t)wr->priv_data;
-
-            cbs[0] = &cb;
-            if (io_submit(mAioContext, 1, cbs) > 0)
-                rc++;
-            else {
-                std::cerr << "ERROR: async read stream failed" << std::endl;
-                break;
-            }
-        } else {
-            rc = readv((int)q_hdl, iov, 2);
-            if (rc < 0) {
-                std::cerr << "ERROR: read stream failed: " << rc << std::endl;
-                break;
-            }
-        }
+    if (qcb->queue_is_h2c()) {
+        xrt_logmsg(XRT_ERROR, "%s: queue is write only", __func__);
+        return -EINVAL;
     }
-    return rc;
 
+    if ((wr->flag & XCL_QUEUE_REQ_NONBLOCKING) &&
+        !mAioEnabled && !(qcb->queue_aio_ctx_enabled())) {
+         xrt_logmsg(XRT_ERROR, "%s: NONBLOCK but aio NOT enabled.\n", __func__);
+         return -EINVAL;
+    }
+
+    return qcb->queue_submit_io(wr, &mAioContext);
 }
 
 uint32_t shim::xclGetNumLiveProcesses()
@@ -1700,7 +2113,7 @@ int shim::xclRegWrite(uint32_t ipIndex, uint32_t offset, uint32_t data)
     return xclRegRW(false, ipIndex, offset, &data);
 }
 
-int shim::xclIPName2Index(const char *name, uint32_t& index)
+int shim::xclIPName2Index(const char *name)
 {
     std::string errmsg;
     std::vector<char> buf;
@@ -1740,8 +2153,7 @@ int shim::xclIPName2Index(const char *name, uint32_t& index)
     if (itr == cus.end())
       return -ENOENT;
 
-    index = std::distance(cus.begin(),itr);
-    return 0;
+    return std::distance(cus.begin(),itr);
 }
 
 /*
@@ -1761,23 +2173,44 @@ int shim::xclStoreAppContext()
 
 unsigned xclProbe()
 {
+#ifdef ENABLE_HAL_PROFILING
+  PROBE_CB;
+#endif
     return pcidev::get_dev_ready();
 }
 
-xclDeviceHandle xclOpen(unsigned deviceIndex, const char *logFileName, xclVerbosityLevel level)
+xclDeviceHandle
+xclOpen(unsigned int deviceIndex, const char*, xclVerbosityLevel)
 {
+  try {
     if(pcidev::get_dev_total() <= deviceIndex) {
-        printf("Cannot find index %u \n", deviceIndex);
-        return nullptr;
+      xrt_core::message::send(xrt_core::message::severity_level::XRT_INFO, "XRT",
+                       std::string("Cannot find index " + std::to_string(deviceIndex) + " \n"));
+      return nullptr;
     }
+#ifdef ENABLE_HAL_PROFILING
+  OPEN_CB;
+#endif
 
-    xocl::shim *handle = new xocl::shim(deviceIndex, logFileName, level);
+    xocl::shim *handle = new xocl::shim(deviceIndex);
 
     return static_cast<xclDeviceHandle>(handle);
+  }
+  catch (const xrt_core::error& ex) {
+    xrt_core::send_exception_message(ex.what());
+  }
+  catch (const std::exception& ex) {
+    xrt_core::send_exception_message(ex.what());
+  }
+
+  return nullptr;
 }
 
 void xclClose(xclDeviceHandle handle)
 {
+#ifdef ENABLE_HAL_PROFILING
+  CLOSE_CB;
+#endif
     xocl::shim *drv = xocl::shim::handleCheck(handle);
     if (drv) {
         delete drv;
@@ -1787,22 +2220,37 @@ void xclClose(xclDeviceHandle handle)
 
 int xclLoadXclBin(xclDeviceHandle handle, const xclBin *buffer)
 {
+  try {
     xocl::shim *drv = xocl::shim::handleCheck(handle);
+
+#ifdef DISABLE_DOWNLOAD_XCLBIN
+    int ret = 0;
+#else
     auto ret = drv ? drv->xclLoadXclBin(buffer) : -ENODEV;
+#endif
+
 #ifdef ENABLE_HAL_PROFILING
     if (ret != 0) return ret ;
     LOAD_XCLBIN_CB ;
 #endif
     if (!ret) {
+      auto core_device = xrt_core::get_userpf_device(drv);
+      core_device->register_axlf(buffer);
+#ifndef DISABLE_DOWNLOAD_XCLBIN
       ret = xrt_core::scheduler::init(handle, buffer);
       START_DEVICE_PROFILING_CB(handle);
+#endif
     }
-    if (!ret && xrt_core::config::get_ert() &&
-      (xclbin::get_axlf_section(buffer, PDI) ||
-      xclbin::get_axlf_section(buffer, BITSTREAM_PARTIAL_PDI)) &&
-      xrt_core::config::get_pdi_load())
-        ret = xrt_core::scheduler::loadXclbinToPS(handle, buffer);
     return ret;
+  }
+  catch (const xrt_core::error& ex) {
+    xrt_core::send_exception_message(ex.what());
+    return ex.get_code();
+  }
+  catch (const std::exception& ex) {
+    xrt_core::send_exception_message(ex.what());
+    return -EINVAL;
+  }
 }
 
 int xclLogMsg(xclDeviceHandle handle, xrtLogMsgLevel level, const char* tag, const char* format, ...)
@@ -1847,12 +2295,18 @@ size_t xclRead(xclDeviceHandle handle, xclAddressSpace space, uint64_t offset, v
 
 int xclRegWrite(xclDeviceHandle handle, uint32_t ipIndex, uint32_t offset, uint32_t data)
 {
+#ifdef ENABLE_HAL_PROFILING
+  REG_WRITE_CB;
+#endif
     xocl::shim *drv = xocl::shim::handleCheck(handle);
     return drv ? drv->xclRegWrite(ipIndex, offset, data) : -ENODEV;
 }
 
 int xclRegRead(xclDeviceHandle handle, uint32_t ipIndex, uint32_t offset, uint32_t *datap)
 {
+#ifdef ENABLE_HAL_PROFILING
+  REG_READ_CB;
+#endif
     xocl::shim *drv = xocl::shim::handleCheck(handle);
     return drv ? drv->xclRegRead(ipIndex, offset, datap) : -ENODEV;
 }
@@ -1888,6 +2342,9 @@ unsigned int xclAllocBO(xclDeviceHandle handle, size_t size, int unused, unsigne
 
 unsigned int xclAllocUserPtrBO(xclDeviceHandle handle, void *userptr, size_t size, unsigned flags)
 {
+#ifdef ENABLE_HAL_PROFILING
+  ALLOC_USERPTR_BO_CB;
+#endif
     xocl::shim *drv = xocl::shim::handleCheck(handle);
     return drv ? drv->xclAllocUserPtrBO(userptr, size, flags) : -ENODEV;
 }
@@ -1948,6 +2405,9 @@ int xclSyncBO(xclDeviceHandle handle, unsigned int boHandle, xclBOSyncDirection 
 int xclCopyBO(xclDeviceHandle handle, unsigned int dst_boHandle,
             unsigned int src_boHandle, size_t size, size_t dst_offset, size_t src_offset)
 {
+#ifdef ENABLE_HAL_PROFILING
+  COPY_BO_CB ;
+#endif
     xocl::shim *drv = xocl::shim::handleCheck(handle);
     return drv ?
       drv->xclCopyBO(dst_boHandle, src_boHandle, size, dst_offset, src_offset) : -ENODEV;
@@ -1961,6 +2421,9 @@ int xclReClock2(xclDeviceHandle handle, unsigned short region, const unsigned sh
 
 int xclLockDevice(xclDeviceHandle handle)
 {
+#ifdef ENABLE_HAL_PROFILING
+  LOCK_DEVICE_CB;
+#endif
     xocl::shim *drv = xocl::shim::handleCheck(handle);
     if (!drv)
         return -ENODEV;
@@ -1969,6 +2432,9 @@ int xclLockDevice(xclDeviceHandle handle)
 
 int xclUnlockDevice(xclDeviceHandle handle)
 {
+#ifdef ENABLE_HAL_PROFILING
+  UNLOCK_DEVICE_CB;
+#endif
     xocl::shim *drv = xocl::shim::handleCheck(handle);
     if (!drv)
         return -ENODEV;
@@ -1987,10 +2453,10 @@ int xclP2pEnable(xclDeviceHandle handle, bool enable, bool force)
     return drv ? drv->p2pEnable(enable, force) : -ENODEV;
 }
 
-int xclCmaEnable(xclDeviceHandle handle, bool enable, uint64_t sz)
+int xclCmaEnable(xclDeviceHandle handle, bool enable, uint64_t total_size)
 {
     xocl::shim *drv = xocl::shim::handleCheck(handle);
-    return drv ? drv->cmaEnable(enable, sz) : -ENODEV;
+    return drv ? drv->cmaEnable(enable, total_size) : -ENODEV;
 }
 
 int xclBootFPGA(xclDeviceHandle handle)
@@ -2077,12 +2543,23 @@ int xclExecWait(xclDeviceHandle handle, int timeoutMilliSec)
 
 int xclOpenContext(xclDeviceHandle handle, uuid_t xclbinId, unsigned int ipIndex, bool shared)
 {
+#ifdef DISABLE_DOWNLOAD_XCLBIN
+  return 0;
+#endif
+
+#ifdef ENABLE_HAL_PROFILING
+  OPEN_CONTEXT_CB;
+#endif
   xocl::shim *drv = xocl::shim::handleCheck(handle);
   return drv ? drv->xclOpenContext(xclbinId, ipIndex, shared) : -ENODEV;
 }
 
 int xclCloseContext(xclDeviceHandle handle, uuid_t xclbinId, unsigned ipIndex)
 {
+#ifdef DISABLE_DOWNLOAD_XCLBIN
+  return 0;
+#endif
+
   xocl::shim *drv = xocl::shim::handleCheck(handle);
   return drv ? drv->xclCloseContext(xclbinId, ipIndex) : -ENODEV;
 }
@@ -2133,6 +2610,18 @@ ssize_t xclReadQueue(xclDeviceHandle handle, uint64_t q_hdl, xclQueueRequest *wr
 {
     xocl::shim *drv = xocl::shim::handleCheck(handle);
     return drv ? drv->xclReadQueue(q_hdl, wr) : -ENODEV;
+}
+
+int xclSetQueueOpt(xclDeviceHandle handle, uint64_t q_hdl, int type, uint32_t val)
+{
+    xocl::shim *drv = xocl::shim::handleCheck(handle);
+    return drv ? drv->xclSetQueueOpt(q_hdl, type, val) : -ENODEV;
+}
+
+int xclPollQueue(xclDeviceHandle handle, uint64_t q_hdl, int min_compl, int max_compl, xclReqCompletion *comps, int* actual, int timeout)
+{
+        xocl::shim *drv = xocl::shim::handleCheck(handle);
+        return drv ? drv->xclPollQueue(q_hdl, min_compl, max_compl, comps, actual, timeout) : -ENODEV;
 }
 
 int xclPollCompletion(xclDeviceHandle handle, int min_compl, int max_compl, xclReqCompletion *comps, int* actual, int timeout)
@@ -2237,10 +2726,10 @@ int xclGetDebugProfileDeviceInfo(xclDeviceHandle handle, xclDebugProfileDeviceIn
   return drv ? drv->xclGetDebugProfileDeviceInfo(info) : -ENODEV;
 }
 
-int xclIPName2Index(xclDeviceHandle handle, const char *name, uint32_t *indexp)
+int xclIPName2Index(xclDeviceHandle handle, const char *name)
 {
   xocl::shim *drv = xocl::shim::handleCheck(handle);
-  return (drv) ? drv->xclIPName2Index(name, *indexp) : -ENODEV;
+  return (drv) ? drv->xclIPName2Index(name) : -ENODEV;
 }
 
 int xclUpdateSchedulerStat(xclDeviceHandle handle)
@@ -2274,3 +2763,10 @@ int xclStoreAppContext(xclDeviceHandle handle)
     return drv ? drv->xclStoreAppContext() : -ENODEV;
 }
 
+void
+xclGetDebugIpLayout(xclDeviceHandle hdl, char* buffer, size_t size, size_t* size_ret)
+{
+  if(size_ret)
+    *size_ret = 0;
+  return;
+}

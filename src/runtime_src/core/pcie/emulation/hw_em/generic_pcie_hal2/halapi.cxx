@@ -18,7 +18,9 @@
  * Copyright (C) 2015 Xilinx, Inc
  */
 
-#include <shim.h>
+#include "shim.h"
+#include "core/common/system.h"
+#include "core/common/device.h"
 
 int xclExportBO(xclDeviceHandle handle, unsigned int boHandle)
 {
@@ -291,9 +293,18 @@ int xclLoadXclBin(xclDeviceHandle handle, const xclBin *buffer)
   xclhwemhal2::HwEmShim *drv = xclhwemhal2::HwEmShim::handleCheck(handle);
   if (!drv)
     return -1;
+#ifdef DISABLE_DOWNLOAD_XCLBIN
+  int ret = 0;
+#else
   auto ret = drv->xclLoadXclBin(buffer);
-  if (!ret)
-      ret = xrt_core::scheduler::init(handle, buffer);
+#endif
+  if (!ret) {
+    auto device = xrt_core::get_userpf_device(drv);
+    device->register_axlf(buffer);
+#ifndef DISABLE_DOWNLOAD_XCLBIN
+    ret = xrt_core::scheduler::init(handle, buffer);
+#endif
+  }
   return ret;
 }
 
@@ -481,3 +492,30 @@ int xclDestroyProfileResults(xclDeviceHandle handle, ProfileResults* results)
 {
   return 0;
 }
+
+void
+xclGetDebugIpLayout(xclDeviceHandle hdl, char* buffer, size_t size, size_t* size_ret)
+{
+  if(size_ret)
+    *size_ret = 0;
+  return;
+}
+
+int xclGetSubdevPath(xclDeviceHandle handle,  const char* subdev,
+                        uint32_t idx, char* path, size_t size)
+{
+  return 0;
+}
+//Mapped CU register space for xclRegRead/Write()  
+int xclRegWrite(xclDeviceHandle handle, uint32_t cu_index, uint32_t offset, uint32_t data)
+{
+  xclhwemhal2::HwEmShim *drv = xclhwemhal2::HwEmShim::handleCheck(handle);
+  return drv ? drv->xclRegWrite(cu_index, offset, data) : -ENODEV;
+}
+
+int xclRegRead(xclDeviceHandle handle, uint32_t cu_index, uint32_t offset, uint32_t *datap)
+{
+  xclhwemhal2::HwEmShim *drv = xclhwemhal2::HwEmShim::handleCheck(handle);
+  return drv ? drv->xclRegRead(cu_index, offset, datap) : -ENODEV;
+}
+

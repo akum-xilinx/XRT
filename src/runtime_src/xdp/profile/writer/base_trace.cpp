@@ -266,18 +266,15 @@ namespace xdp {
   }
 
   // Functions for device trace
-  void TraceWriterI::writeDeviceTrace(const TraceParser::TraceResultVector &resultVector,
+  void TraceWriterI::writeDeviceTrace(const DeviceTrace &tr,
       std::string deviceName, std::string binaryName)
   {
     if (!Trace_ofs.is_open())
       return;
 
-    for (auto it = resultVector.begin(); it != resultVector.end(); it++) {
-      DeviceTrace tr = *it;
-
 #ifndef XDP_VERBOSE
       if (tr.Kind == DeviceTrace::DEVICE_BUFFER)
-        continue;
+        return;
 #endif
 
       double deviceClockDurationUsec = (1.0 / (mPluginHandle->getKernelClockFreqMHz(deviceName)));
@@ -326,11 +323,11 @@ namespace xdp {
         std::string portName;
         std::string cuPortName;
         if (tr.Kind == DeviceTrace::DEVICE_KERNEL && (tr.Type == "Kernel" || tr.Type.find("Stall") != std::string::npos)) {
-          mPluginHandle->getProfileSlotName(XCL_PERF_MON_ACCEL, deviceName, tr.SlotNum, cuName);
+          mPluginHandle->getTraceSlotName(XCL_PERF_MON_ACCEL, deviceName, tr.SlotNum, cuName);
         }
         else {
           if (tr.Kind == DeviceTrace::DEVICE_STREAM){
-            mPluginHandle->getProfileSlotName(XCL_PERF_MON_STR, deviceName, tr.SlotNum, cuPortName);
+            mPluginHandle->getTraceSlotName(XCL_PERF_MON_STR, deviceName, tr.SlotNum, cuPortName);
             size_t sepIndex = cuPortName.find(IP_LAYOUT_SEP);
             // New format : "MasterName-SlaveName"
             if (sepIndex != std::string::npos) {
@@ -341,7 +338,7 @@ namespace xdp {
             }
           }
           else {
-            mPluginHandle->getProfileSlotName(XCL_PERF_MON_MEMORY, deviceName, tr.SlotNum, cuPortName);
+            mPluginHandle->getTraceSlotName(XCL_PERF_MON_MEMORY, deviceName, tr.SlotNum, cuPortName);
           }
           cuName = cuPortName.substr(0, cuPortName.find_first_of("/"));
           portName = cuPortName.substr(cuPortName.find_first_of("/")+1);
@@ -362,7 +359,7 @@ namespace xdp {
       if (tr.Type == "Kernel") {
         std::string workGroupSize;
         mPluginHandle->getTraceStringFromComputeUnit(deviceName, cuName, traceName);
-        if (traceName.empty()) continue;
+        if (traceName.empty()) return;
         size_t pos = traceName.find_last_of("|");
         workGroupSize = traceName.substr(pos + 1);
         traceName = traceName.substr(0, pos);
@@ -374,7 +371,7 @@ namespace xdp {
         writeTableRowStart(getStream());
         writeTableCells(getStream(), endStr.str(), traceName, "END", "", workGroupSize, tr.EventID);
         writeTableRowEnd(getStream());
-        continue;
+        return;
       }
 
       double deviceDuration = 1000.0*(tr.End - tr.Start);
@@ -385,7 +382,6 @@ namespace xdp {
           tr.StartTime, tr.EndTime, deviceDuration,
           startStr.str(), endStr.str());
       writeTableRowEnd(getStream());
-    }
   }
 
 } // xdp

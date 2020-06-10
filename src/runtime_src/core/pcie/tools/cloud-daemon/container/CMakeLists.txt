@@ -21,8 +21,8 @@ target_link_libraries(container_mpd_plugin
   xrt_core_static
   xrt_coreutil_static
   uuid
-  boost_filesystem
-  boost_system
+  ${Boost_FILESYSTEM_LIBRARY}
+  ${Boost_SYSTEM_LIBRARY}
   pthread
   rt
   crypto
@@ -30,7 +30,7 @@ target_link_libraries(container_mpd_plugin
 
 install(TARGETS container_mpd_plugin
   LIBRARY
-  DESTINATION ${XRT_INSTALL_DIR}/lib
+  DESTINATION ${XRT_INSTALL_LIB_DIR}
   COMPONENT container
   )
 endif (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "arm")

@@ -53,7 +53,16 @@ module_param(minimum_initialization, int, (S_IRUGO|S_IWUSR));
 MODULE_PARM_DESC(minimum_initialization,
 	"Enable minimum_initialization to force driver to load without vailid firmware or DSA. Thus xbsak flash is able to upgrade firmware. (0 = normal initialization, 1 = minimum initialization)");
 
-#define	HI_TEMP			85
+#if defined(__PPC64__)
+int xrt_reset_syncup = 1;
+#else
+int xrt_reset_syncup;
+#endif
+module_param(xrt_reset_syncup, int, (S_IRUGO|S_IWUSR));
+MODULE_PARM_DESC(xrt_reset_syncup,
+        "Enable config space syncup for pci hot reset");
+
+#define	HI_TEMP			88
 #define	LOW_MILLVOLT		500
 #define	HI_MILLVOLT		2500
 
@@ -338,7 +347,7 @@ static int create_char(struct xclmgmt_dev *lro)
 	lro_char->sys_device = device_create(xrt_class,
 				&lro->core.pdev->dev,
 				lro_char->cdev->dev, NULL,
-				DRV_NAME "%d", lro->instance);
+				DRV_NAME "%u", lro->instance);
 
 	if (IS_ERR(lro_char->sys_device)) {
 		rc = PTR_ERR(lro_char->sys_device);
@@ -395,7 +404,7 @@ struct pci_dev *find_user_node(const struct pci_dev *pdev)
 inline void check_temp_within_range(struct xclmgmt_dev *lro, u32 temp)
 {
 	if (temp > HI_TEMP)
-		mgmt_err(lro, "Temperature is too high: %d.", temp);
+		mgmt_err(lro, "Warning: A Xilinx acceleration device is reporting a temperature of %dC. There is a card shutdown limit if the device hits 97C. Please keep the device below 88C.", temp);
 }
 
 inline void check_volt_within_range(struct xclmgmt_dev *lro, u16 volt)
@@ -438,6 +447,39 @@ static void check_sensor(struct xclmgmt_dev *lro)
 	vfree(s);
 }
 
+static void check_pcie_link_toggle(struct xclmgmt_dev *lro, int clear)
+{
+	u32 sts;
+	int err;
+
+
+	err = xocl_iores_read32(lro, XOCL_SUBDEV_LEVEL_BLD,
+			IORES_PCIE_MON, 0x8, &sts);
+	if (err)
+		return;
+
+	if (sts && !clear) {
+		mgmt_err(lro, "PCI link toggle was detected\n");
+		clear = 1;
+	}
+
+	if (clear) {
+		
+		xocl_iores_write32(lro,XOCL_SUBDEV_LEVEL_BLD ,
+				IORES_PCIE_MON, 0, 1);
+
+		xocl_iores_read32(lro, XOCL_SUBDEV_LEVEL_BLD,
+				IORES_PCIE_MON, 0, &sts);
+
+		xocl_iores_write32(lro, XOCL_SUBDEV_LEVEL_BLD,
+				IORES_PCIE_MON, 0, 0);
+	}
+
+		
+
+}
+
+
 static int health_check_cb(void *data)
 {
 	struct xclmgmt_dev *lro = (struct xclmgmt_dev *)data;
@@ -451,6 +493,9 @@ static int health_check_cb(void *data)
 	(void) xocl_clock_status(lro, &latched);
 
 	check_sensor(lro);
+
+	/* Check PCIe Link Toggle */
+	check_pcie_link_toggle(lro, 0);
 
 	/*
 	 * Checking firewall should be the last thing to do.
@@ -508,7 +553,7 @@ struct xocl_pci_funcs xclmgmt_pci_ops = {
 	.reset = xclmgmt_reset,
 };
 
-static void xclmgmt_icap_get_data(struct xclmgmt_dev *lro, void *buf)
+static int xclmgmt_icap_get_data_impl(struct xclmgmt_dev *lro, void *buf)
 {
 	struct xcl_pr_region *hwicap = NULL;
 	int err = 0;
@@ -516,7 +561,7 @@ static void xclmgmt_icap_get_data(struct xclmgmt_dev *lro, void *buf)
 
 	err = XOCL_GET_XCLBIN_ID(lro, xclbin_id);
 	if (err)
-		return;
+		return err;
 
 	hwicap = (struct xcl_pr_region *)buf;
 	hwicap->idcode = xocl_icap_get_data(lro, IDCODE);
@@ -529,8 +574,30 @@ static void xclmgmt_icap_get_data(struct xclmgmt_dev *lro, void *buf)
 	hwicap->freq_cntr_1 = xocl_icap_get_data(lro, FREQ_COUNTER_1);
 	hwicap->freq_cntr_2 = xocl_icap_get_data(lro, FREQ_COUNTER_2);
 	hwicap->mig_calib = lro->ready ? xocl_icap_get_data(lro, MIG_CALIB) : 0;
+	hwicap->data_retention = xocl_icap_get_data(lro, DATA_RETAIN);
 
 	XOCL_PUT_XCLBIN_ID(lro);
+
+	return 0;
+}
+
+static void xclmgmt_clock_get_data_impl(struct xclmgmt_dev *lro, void *buf)
+{
+	struct xcl_pr_region *hwicap = NULL;
+
+	hwicap = (struct xcl_pr_region *)buf;
+	hwicap->freq_0 = xocl_clock_get_data(lro, CLOCK_FREQ_0);
+	hwicap->freq_1 = xocl_clock_get_data(lro, CLOCK_FREQ_1);
+	hwicap->freq_2 = xocl_clock_get_data(lro, CLOCK_FREQ_2);
+	hwicap->freq_cntr_0 = xocl_clock_get_data(lro, FREQ_COUNTER_0);
+	hwicap->freq_cntr_1 = xocl_clock_get_data(lro, FREQ_COUNTER_1);
+	hwicap->freq_cntr_2 = xocl_clock_get_data(lro, FREQ_COUNTER_2);
+}
+
+static void xclmgmt_icap_get_data(struct xclmgmt_dev *lro, void *buf)
+{
+	if (xclmgmt_icap_get_data_impl(lro, buf) == -ENODEV)
+		xclmgmt_clock_get_data_impl(lro, buf);
 }
 
 static void xclmgmt_mig_get_data(struct xclmgmt_dev *lro, void *mig_ecc, size_t entry_sz)
@@ -552,20 +619,28 @@ static void xclmgmt_subdev_get_data(struct xclmgmt_dev *lro, size_t offset,
 {
 	struct xcl_subdev	*hdr;
 	size_t			data_sz, fdt_sz;
+	int			rtn_code = 0;
 
 	mgmt_info(lro, "userpf requests subdev information");
 
-	data_sz = sizeof(*hdr);
-	fdt_sz = lro->userpf_blob ? fdt_totalsize(lro->userpf_blob) : 0;
-	data_sz += fdt_sz > offset ? (fdt_sz - offset) : 0;
+	if (lro->rp_program == XOCL_RP_PROGRAM_REQ) {
+		/* previous request is missed */
+		data_sz = sizeof(*hdr);
+		rtn_code = XOCL_MSG_SUBDEV_RTN_PENDINGPLP;
+	} else {
+		fdt_sz = lro->userpf_blob ? fdt_totalsize(lro->userpf_blob) : 0;
+		data_sz = fdt_sz > offset ? (fdt_sz - offset) : 0;
+		if (data_sz + offset < fdt_sz)
+			rtn_code = XOCL_MSG_SUBDEV_RTN_PARTIAL;
+		else if (!lro->userpf_blob_updated)
+			rtn_code = XOCL_MSG_SUBDEV_RTN_UNCHANGED;
+		else
+			rtn_code = XOCL_MSG_SUBDEV_RTN_COMPLETE;
+
+		data_sz += sizeof(*hdr);
+	}
 
 	*actual_sz = min_t(size_t, buf_sz, data_sz);
-
-	*resp = vzalloc(*actual_sz);
-	if (!*resp) {
-		mgmt_err(lro, "allocate resp failed");
-		return;
-	}
 
 	/* if it is invalid req, do nothing */
 	if (*actual_sz < sizeof(*hdr)) {
@@ -573,27 +648,27 @@ static void xclmgmt_subdev_get_data(struct xclmgmt_dev *lro, size_t offset,
 		return;
 	}
 
+	*resp = vzalloc(*actual_sz);
+	if (!*resp) {
+		mgmt_err(lro, "allocate resp failed");
+		return;
+	}
+
 	hdr = *resp;
 	hdr->ver = XOCL_MSG_SUBDEV_VER;
 	hdr->size = *actual_sz - sizeof(*hdr);
 	hdr->offset = offset;
+	hdr->rtncode = rtn_code;
 	//hdr->checksum = csum_partial(hdr->data, hdr->size, 0);
 	if (hdr->size > 0)
 		memcpy(hdr->data, (char *)lro->userpf_blob + offset, hdr->size);
-
-	if (hdr->size + offset < fdt_sz)
-		hdr->rtncode = XOCL_MSG_SUBDEV_RTN_PARTIAL;
-	else if (!lro->userpf_blob_updated)
-		hdr->rtncode = XOCL_MSG_SUBDEV_RTN_UNCHANGED;
-	else
-		hdr->rtncode = XOCL_MSG_SUBDEV_RTN_COMPLETE;
 
 	lro->userpf_blob_updated = false;
 }
 
 static int xclmgmt_read_subdev_req(struct xclmgmt_dev *lro, char *data_ptr, void **resp, size_t *sz)
 {
-	size_t resp_sz = 0, current_sz;
+	size_t resp_sz = 0, current_sz = 0;
 	struct xcl_mailbox_subdev_peer *subdev_req = (struct xcl_mailbox_subdev_peer *)data_ptr;
 
 	BUG_ON(!lro);
@@ -730,6 +805,7 @@ void xclmgmt_mailbox_srv(void *arg, void *data, size_t len,
 		uint64_t xclbin_len = 0;
 		struct xcl_mailbox_bitstream_kaddr *mb_kaddr =
 			(struct xcl_mailbox_bitstream_kaddr *)req->data;
+
 		if (payload_len < sizeof(*mb_kaddr)) {
 			mgmt_err(lro, "peer request dropped, wrong size\n");
 			break;
@@ -745,7 +821,10 @@ void xclmgmt_mailbox_srv(void *arg, void *data, size_t len,
 			ret = -ENOMEM;
 		} else {
 			memcpy(buf, xclbin, xclbin_len);
-			ret = xocl_icap_download_axlf(lro, buf);
+			if (XOCL_DSA_IS_VERSAL(lro))
+				ret = xocl_xfer_versal_download_axlf(lro, buf);
+			else
+				ret = xocl_icap_download_axlf(lro, buf);
 			vfree(buf);
 		}
 		(void) xocl_peer_response(lro, req->req, msgid, &ret,
@@ -777,7 +856,12 @@ void xclmgmt_mailbox_srv(void *arg, void *data, size_t len,
 			mgmt_err(lro, "peer request dropped, wrong size\n");
 			break;
 		}
+
 		ret = xocl_icap_ocl_update_clock_freq_topology(lro, clk);
+		if (ret == -ENODEV)
+		    ret = xocl_clock_update_freq(lro, clk->ocl_target_freq,
+		        ARRAY_SIZE(clk->ocl_target_freq), 1);
+
 		(void) xocl_peer_response(lro, req->req, msgid, &ret,
 			sizeof(ret));
 		break;
@@ -815,6 +899,9 @@ void xclmgmt_mailbox_srv(void *arg, void *data, size_t len,
 			break;
 		}
 
+		if (lro->rp_program == XOCL_RP_PROGRAM)
+			lro->rp_program = 0;
+
 		resp = vzalloc(sizeof(*resp));
 		if (!resp)
 			break;
@@ -833,10 +920,10 @@ void xclmgmt_mailbox_srv(void *arg, void *data, size_t len,
 		break;
 	}
 	case XCL_MAILBOX_REQ_PROGRAM_SHELL: {
-		/* blob should already been updated */
-		ret = xclmgmt_program_shell(lro);
+		lro->rp_program = XOCL_RP_PROGRAM;
 		(void) xocl_peer_response(lro, req->req, msgid, &ret,
 				sizeof(ret));
+		ret = xocl_queue_work(lro, XOCL_WORK_PROGRAM_SHELL, 0);
 		break;
 	}
 	case XCL_MAILBOX_REQ_READ_P2P_BAR_ADDR: {
@@ -970,7 +1057,17 @@ static void xclmgmt_extended_probe(struct xclmgmt_dev *lro)
 	if (!(dev_info->flags & (XOCL_DSAFLAG_SMARTN | XOCL_DSAFLAG_VERSAL | XOCL_DSAFLAG_MPSOC)))
 		ret = xocl_icap_download_boot_firmware(lro);
 
-	/* return -ENODEV for 2RP platform */
+	/*
+	 * All 2.0 shell will not have icap for mgmt at this moment, thus we will
+	 * get ENODEV (see RES_MGMT_VSEC).
+	 * If we don't want to break the existing rule but still apply the rule
+	 * like if versal has vesc, then it is a 2.0 shell. We can add the following
+	 * condition.
+	 */
+	if ((dev_info->flags & XOCL_DSAFLAG_VERSAL) &&
+	    xocl_subdev_is_vsec(lro))
+		ret = -ENODEV;
+
 	if (!ret) {
 		xocl_thread_start(lro);
 
@@ -985,6 +1082,9 @@ static void xclmgmt_extended_probe(struct xclmgmt_dev *lro)
 			goto fail_all_subdev;
 	} else
 		goto fail_all_subdev;
+
+	/* Reset PCI link monitor */
+	check_pcie_link_toggle(lro, 1);
 
 	/* Notify our peer that we're listening. */
 	xclmgmt_connect_notify(lro, true);
@@ -1046,6 +1146,12 @@ static void xclmgmt_work_cb(struct work_struct *work)
 		ret = (int) xclmgmt_hot_reset(lro, true);
 		if (!ret)
 			xocl_drvinst_set_offline(lro, false);
+		break;
+	case XOCL_WORK_PROGRAM_SHELL:
+		/* blob should already been updated */
+		ret = xclmgmt_program_shell(lro);
+		if (!ret)
+			xclmgmt_connect_notify(lro, true);
 		break;
 	default:
 		mgmt_err(lro, "Invalid op code %d", _work->op);
@@ -1163,8 +1269,6 @@ static int xclmgmt_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	(void) xocl_subdev_create_by_level(lro, XOCL_SUBDEV_LEVEL_BLD);
 	(void) xocl_subdev_create_vsec_devs(lro);
 
-
-
 	return 0;
 
 err_init_sysfs:
@@ -1234,8 +1338,8 @@ static void xclmgmt_remove(struct pci_dev *pdev)
 		vfree(lro->core.fdt_blob);
 	if (lro->userpf_blob)
 		vfree(lro->userpf_blob);
-	if (lro->bld_blob)
-		vfree(lro->bld_blob);
+	if (lro->core.blp_blob)
+		vfree(lro->core.blp_blob);
 
 	dev_set_drvdata(&pdev->dev, NULL);
 
@@ -1296,8 +1400,11 @@ static int (*drv_reg_funcs[])(void) __initdata = {
 	xocl_init_xmc,
 	xocl_init_dna,
 	xocl_init_fmgr,
-	xocl_init_ospi_versal,
+	xocl_init_xfer_versal,
+	xocl_init_srsr,
 	xocl_init_mem_hbm,
+	xocl_init_ulite,
+	xocl_init_calib_storage,
 };
 
 static void (*drv_unreg_funcs[])(void) = {
@@ -1321,8 +1428,11 @@ static void (*drv_unreg_funcs[])(void) = {
 	xocl_fini_xmc,
 	xocl_fini_dna,
 	xocl_fini_fmgr,
-	xocl_fini_ospi_versal,
+	xocl_fini_xfer_versal,
+	xocl_fini_srsr,
 	xocl_fini_mem_hbm,
+	xocl_fini_ulite,
+	xocl_fini_calib_storage,
 };
 
 static int __init xclmgmt_init(void)

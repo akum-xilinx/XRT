@@ -46,8 +46,8 @@ if (${INTERNAL_TESTING})
   xrt_coreutil
   pthread
   rt
-  boost_filesystem
-  boost_system
+  ${Boost_FILESYSTEM_LIBRARY}
+  ${Boost_SYSTEM_LIBRARY}
   uuid
   )
 else ()
@@ -56,8 +56,8 @@ else ()
   xrt_coreutil
   pthread
   rt
-  boost_filesystem
-  boost_system
+  ${Boost_FILESYSTEM_LIBRARY}
+  ${Boost_SYSTEM_LIBRARY}
   uuid
   ${AWS_FPGA_MGMT_LIB_DIR}/libfpga_mgmt.a
 )
@@ -65,7 +65,7 @@ endif ()
 
 install(TARGETS xrt_aws
         LIBRARY
-        DESTINATION ${XRT_INSTALL_DIR}/lib
+        DESTINATION ${XRT_INSTALL_LIB_DIR}
         COMPONENT aws)
 
 endif (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "arm")

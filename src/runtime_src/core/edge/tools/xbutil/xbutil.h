@@ -457,11 +457,9 @@ public:
         ostr << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n";
         ostr << "Compute Unit Status\n";
         try {
-          int cu_i = 0;
           for (auto& v : sensor_tree::get_child( "board.compute_unit" )) {
             int index = std::stoi(v.first);
             if ( index >= 0 ) {
-              uint32_t cu_i;
               std::string cu_n, cu_s, cu_ba;
               for (auto& subv : v.second) {
                 if ( subv.first == "name" ) {
@@ -473,7 +471,8 @@ public:
                   cu_s = subv.second.get_value<std::string>();
                 }
               }
-              if (xclIPName2Index(m_handle, cu_n.c_str(), &cu_i) != 0) {
+              int cu_i = xclIPName2Index(m_handle, cu_n.c_str());
+              if (cu_i < 0) {
                 ostr << "CU: ";
               } else {
                 ostr << "CU[" << std::right << std::setw(2) << cu_i << "]: ";
@@ -491,8 +490,8 @@ public:
         return 0;
     }
 
-/* 
- * program    
+/*
+ * program
  */
     int program(const std::string& xclbin, unsigned region) {
         std::ifstream stream(xclbin.c_str());
@@ -523,12 +522,7 @@ public:
         std::vector<char> buffer(length);
         stream.read(buffer.data(), length);
         const xclBin *header = (const xclBin *)buffer.data();
-        int result = xclLockDevice(m_handle);
-        if (result == 0)
-            result = xclLoadXclBin(m_handle, header);
-        (void) xclUnlockDevice(m_handle);
-
-        return result;
+        return xclLoadXclBin(m_handle, header);
     }
 
     int boot() { std::cout << "Unsupported API " << std::endl; return -1; }
@@ -546,10 +540,10 @@ public:
     uint32_t getIPCountAddrNames(int type,
 				 std::vector<uint64_t>* baseAddress,
 				 std::vector<std::string>* portNames);
-    std::pair<size_t, size_t> 
+    std::pair<size_t, size_t>
       getCUNamePortName(std::vector<std::string>& aSlotNames,
 			std::vector<std::pair<std::string, std::string> >& aCUNamePortNames);
-    std::pair<size_t, size_t> 
+    std::pair<size_t, size_t>
       getStreamName(const std::vector<std::string>& aSlotNames,
 		    std::vector<std::pair<std::string, std::string> >& aStreamNames) ;
     int readAIMCounters() ;

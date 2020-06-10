@@ -62,6 +62,7 @@ SET (XRT_DKMS_DRIVER_SRCS
   xocl/userpf/xocl_sysfs.c
   xocl/userpf/xocl_drv.c
   xocl/userpf/xocl_kernel_api.c
+  xocl/userpf/xocl_kds.c
   xocl/userpf/xocl.dracut.conf
   xocl/userpf/10-xocl.rules
   xocl/userpf/Makefile
@@ -153,6 +154,13 @@ SET (XRT_DKMS_DRIVER_SRCS
   xocl/subdev/trace_funnel.c
   xocl/subdev/trace_s2mm.c
   xocl/subdev/memory_hbm.c
+  xocl/subdev/ddr_srsr.c
+  xocl/subdev/ulite.c
+  xocl/subdev/calib_storage.c
+  xocl/subdev/address_translator.c
+  xocl/subdev/cu_ctrl.c
+  xocl/subdev/cu.c
+  xocl/subdev/p2p.c
   xocl/Makefile
   )
 
@@ -164,6 +172,7 @@ SET (XRT_DKMS_DRIVER_INCLUDES
   include/mgmt-ioctl.h
   include/qdma_ioctl.h
   include/mailbox_proto.h
+  include/flash_xrt_data.h
   )
 
 # includes relative to core
@@ -176,7 +185,19 @@ SET (XRT_DKMS_CORE_INCLUDES
   )
 
 SET (XRT_DKMS_COMMON_XRT_DRV
-  common/drv/xrt_drv.h
+  common/drv/kds_core.c
+  common/drv/kds_cu_ctrl.c
+  common/drv/xrt_cu.c
+  common/drv/cu_hls.c
+  common/drv/cu_plram.c
+  )
+
+SET (XRT_DKMS_COMMON_XRT_DRV_INCLUDES
+  common/drv/include/xrt_drv.h
+  common/drv/include/kds_core.h
+  common/drv/include/kds_cu_ctrl.h
+  common/drv/include/kds_command.h
+  common/drv/include/xrt_cu.h
   )
 
 SET (XRT_DKMS_ABS_SRCS)
@@ -197,7 +218,10 @@ foreach (DKMS_FILE ${XRT_DKMS_CORE_INCLUDES})
 endforeach()
 
 foreach (DKMS_FILE ${XRT_DKMS_COMMON_XRT_DRV})
-  get_filename_component(DKMS_DIR ${DKMS_FILE} DIRECTORY)
+  install (FILES ${XRT_DKMS_CORE_DIR}/${DKMS_FILE} DESTINATION ${XRT_DKMS_INSTALL_DRIVER_DIR}/common/)
+endforeach()
+
+foreach (DKMS_FILE ${XRT_DKMS_COMMON_XRT_DRV_INCLUDES})
   install (FILES ${XRT_DKMS_CORE_DIR}/${DKMS_FILE} DESTINATION ${XRT_DKMS_INSTALL_DRIVER_DIR}/include/)
 endforeach()
 

@@ -31,7 +31,10 @@ set(XRT_XDP_PROFILE_WRITER_DIR         "${CMAKE_CURRENT_SOURCE_DIR}/profile/writ
 set(XRT_XDP_PROFILE_HAL_WRITER_DIR     "${CMAKE_CURRENT_SOURCE_DIR}/profile/writer/hal")
 set(XRT_XDP_PROFILE_CORE_DIR           "${CMAKE_CURRENT_SOURCE_DIR}/profile/core")
 set(XRT_XDP_PROFILE_DEVICE_DIR         "${CMAKE_CURRENT_SOURCE_DIR}/profile/device")
+set(XRT_XDP_PROFILE_DEVICE_MMAPPED_MON_DIR "${CMAKE_CURRENT_SOURCE_DIR}/profile/device/mmapped_monitors")
+set(XRT_XDP_PROFILE_OCL_DEVICE_LOGGER_DIR  "${CMAKE_CURRENT_SOURCE_DIR}/profile/device/ocl_device_logger")
 set(XRT_XDP_PROFILE_HAL_DEVICE_DIR     "${CMAKE_CURRENT_SOURCE_DIR}/profile/device/hal_device")
+set(XRT_XDP_PROFILE_XRT_DEVICE_DIR     "${CMAKE_CURRENT_SOURCE_DIR}/profile/device/xrt_device")
 set(XRT_XDP_PROFILE_LOP_PLUGIN_DIR     "${CMAKE_CURRENT_SOURCE_DIR}/profile/plugin/lop")
 set(XRT_XDP_PROFILE_LOP_WRITER_DIR     "${CMAKE_CURRENT_SOURCE_DIR}/profile/writer/lop")
 
@@ -39,6 +42,7 @@ set(XRT_XDP_PROFILE_LOP_WRITER_DIR     "${CMAKE_CURRENT_SOURCE_DIR}/profile/writ
 set(XRT_XDP_PROFILE_BASE_PLUGIN_DIR    "${CMAKE_CURRENT_SOURCE_DIR}/profile/plugin/vp_base")
 set(XRT_XDP_PROFILE_DATABASE_DIR       "${CMAKE_CURRENT_SOURCE_DIR}/profile/database")
 set(XRT_XDP_PROFILE_EVENTS_DIR         "${CMAKE_CURRENT_SOURCE_DIR}/profile/database/events")
+set(XRT_XDP_PROFILE_EVENTS_CREATOR_DIR         "${CMAKE_CURRENT_SOURCE_DIR}/profile/database/events/creator")
 set(XRT_XDP_PROFILE_VP_WRITER_DIR      "${CMAKE_CURRENT_SOURCE_DIR}/profile/writer/vp_base")
 
 file(GLOB XRT_NEW_XDP_CORE_FILES
@@ -46,8 +50,14 @@ file(GLOB XRT_NEW_XDP_CORE_FILES
   "${XRT_XDP_PROFILE_BASE_PLUGIN_DIR}/*.cpp"
   "${XRT_XDP_PROFILE_DATABASE_DIR}/*.h"
   "${XRT_XDP_PROFILE_DATABASE_DIR}/*.cpp"
+  "${XRT_XDP_PROFILE_DEVICE_DIR}/*.h"
+  "${XRT_XDP_PROFILE_DEVICE_DIR}/*.cpp"
+  "${XRT_XDP_PROFILE_DEVICE_MMAPPED_MON_DIR}/*.h"
+  "${XRT_XDP_PROFILE_DEVICE_MMAPPED_MON_DIR}/*.cpp"
   "${XRT_XDP_PROFILE_EVENTS_DIR}/*.h"
   "${XRT_XDP_PROFILE_EVENTS_DIR}/*.cpp"
+  "${XRT_XDP_PROFILE_EVENTS_CREATOR_DIR}/*.h"
+  "${XRT_XDP_PROFILE_EVENTS_CREATOR_DIR}/*.cpp"
   "${XRT_XDP_PROFILE_VP_WRITER_DIR}/*.h"
   "${XRT_XDP_PROFILE_VP_WRITER_DIR}/*.cpp"
   )
@@ -77,6 +87,12 @@ file(GLOB XRT_XDP_PROFILE_FILES
   "${XRT_XDP_PROFILE_CORE_DIR}/*.cpp"
   "${XRT_XDP_PROFILE_DEVICE_DIR}/*.h"
   "${XRT_XDP_PROFILE_DEVICE_DIR}/*.cpp"
+  "${XRT_XDP_PROFILE_DEVICE_MMAPPED_MON_DIR}/*.h"
+  "${XRT_XDP_PROFILE_DEVICE_MMAPPED_MON_DIR}/*.cpp"
+  "${XRT_XDP_PROFILE_OCL_DEVICE_LOGGER_DIR}/*.h"
+  "${XRT_XDP_PROFILE_OCL_DEVICE_LOGGER_DIR}/*.cpp"
+  "${XRT_XDP_PROFILE_XRT_DEVICE_DIR}/*.h"
+  "${XRT_XDP_PROFILE_XRT_DEVICE_DIR}/*.cpp"
   "${XRT_XDP_PROFILE_PLUGIN_DIR}/*.h"
   "${XRT_XDP_PROFILE_PLUGIN_DIR}/*.cpp"
   )
@@ -132,30 +148,35 @@ if (NOT WIN32)
 add_library(xdp_core SHARED ${XRT_NEW_XDP_CORE_FILES})
 add_library(xdp SHARED ${XRT_XDP_ALL_SRC})
 add_library(oclxdp SHARED ${XRT_XDP_PROFILE_OCL_PLUGIN_FILES})
-add_library(xdp_hal_plugin SHARED ${XRT_XDP_PROFILE_HAL_PLUGIN_FILES})
-add_library(xdp_hal_api_interface_plugin SHARED ${XRT_XDP_PROFILE_HAL_INTERFACE_PLUGIN_FILES})
-add_library(xdp_debug_plugin SHARED ${XRT_XDP_DEBUG_FILES})
-add_library(xdp_appdebug_plugin SHARED ${XRT_XDP_APPDEBUG_FILES})
-add_library(xdp_lop_plugin SHARED ${XRT_XDP_PROFILE_LOP_PLUGIN_FILES})
 
-add_dependencies(xdp xrt_core xilinxopencl)
-add_dependencies(oclxdp xdp xilinxopencl)
-add_dependencies(xdp_hal_plugin xdp_core)
-add_dependencies(xdp_hal_api_interface_plugin xdp)
-add_dependencies(xdp_debug_plugin xrt_core xilinxopencl)
-add_dependencies(xdp_appdebug_plugin xrt_core xilinxopencl)
+# Plugin modules
+add_library(xdp_hal_plugin MODULE ${XRT_XDP_PROFILE_HAL_PLUGIN_FILES})
+add_library(xdp_hal_api_interface_plugin MODULE ${XRT_XDP_PROFILE_HAL_INTERFACE_PLUGIN_FILES})
+add_library(xdp_debug_plugin MODULE ${XRT_XDP_DEBUG_FILES})
+add_library(xdp_appdebug_plugin MODULE ${XRT_XDP_APPDEBUG_FILES})
+add_library(xdp_lop_plugin MODULE ${XRT_XDP_PROFILE_LOP_PLUGIN_FILES})
+
+add_dependencies(xdp xrt_coreutil)
+add_dependencies(oclxdp xilinxopencl xdp)
+add_dependencies(xdp_core xrt_coreutil)
+add_dependencies(xdp_hal_plugin xdp_core xdp xrt_core)
+add_dependencies(xdp_hal_api_interface_plugin xdp )
+add_dependencies(xdp_debug_plugin xrt_coreutil xilinxopencl)
+add_dependencies(xdp_appdebug_plugin xrt_coreutil xilinxopencl)
 add_dependencies(xdp_lop_plugin xdp_core)
 
-target_link_libraries(xdp xrt_core xilinxopencl)
-target_link_libraries(oclxdp xdp xilinxopencl)
-target_link_libraries(xdp_hal_plugin xdp_core)
-target_link_libraries(xdp_hal_api_interface_plugin xdp)
-target_link_libraries(xdp_debug_plugin xrt_core xilinxopencl)
-target_link_libraries(xdp_appdebug_plugin xrt_core xilinxopencl)
+target_link_libraries(xdp xrt_coreutil)
+target_link_libraries(oclxdp xilinxopencl xdp)
+target_link_libraries(xdp_core xrt_coreutil)
+target_link_libraries(xdp_hal_plugin xdp_core xdp xrt_core)
+target_link_libraries(xdp_hal_api_interface_plugin xdp xrt_core)
+target_link_libraries(xdp_debug_plugin xrt_coreutil xilinxopencl)
+target_link_libraries(xdp_appdebug_plugin xrt_coreutil xilinxopencl)
 target_link_libraries(xdp_lop_plugin xdp_core)
 
 # ====== Linux Specifics =======
 
+set_target_properties(xdp_core PROPERTIES VERSION ${XRT_VERSION_STRING} SOVERSION ${XRT_SOVERSION})
 set_target_properties(xdp PROPERTIES VERSION ${XRT_VERSION_STRING} SOVERSION ${XRT_SOVERSION})
 set_target_properties(oclxdp PROPERTIES VERSION ${XRT_VERSION_STRING} SOVERSION ${XRT_SOVERSION})
 set_target_properties(xdp_hal_plugin PROPERTIES VERSION ${XRT_VERSION_STRING} SOVERSION ${XRT_SOVERSION})
@@ -164,7 +185,9 @@ set_target_properties(xdp_debug_plugin PROPERTIES VERSION ${XRT_VERSION_STRING} 
 set_target_properties(xdp_appdebug_plugin PROPERTIES VERSION ${XRT_VERSION_STRING} SOVERSION ${XRT_SOVERSION})
 set_target_properties(xdp_lop_plugin PROPERTIES VERSION ${XRT_VERSION_STRING} SOVERSION ${XRT_SOVERSION})
 
-install (TARGETS xdp oclxdp xdp_core xdp_hal_plugin xdp_hal_api_interface_plugin xdp_debug_plugin xdp_appdebug_plugin xdp_lop_plugin LIBRARY DESTINATION ${XRT_INSTALL_DIR}/lib)
+install (TARGETS xdp oclxdp xdp_core LIBRARY DESTINATION ${XRT_INSTALL_LIB_DIR})
+
+install (TARGETS xdp_hal_plugin xdp_hal_api_interface_plugin xdp_debug_plugin xdp_appdebug_plugin xdp_lop_plugin LIBRARY DESTINATION ${XRT_INSTALL_LIB_DIR}/xrt/module)
 
 install (FILES "${XRT_XDP_PROFILE_XMA_PLUGIN_DIR}/xma_profile.h" DESTINATION ${XRT_INSTALL_INCLUDE_DIR})
 
@@ -202,8 +225,14 @@ file(GLOB XRT_XDP_ALL_SRC_WIN
   "${XRT_XDP_PROFILE_DATABASE_DIR}/*.cpp"
   "${XRT_XDP_PROFILE_EVENTS_DIR}/*.h"
   "${XRT_XDP_PROFILE_EVENTS_DIR}/*.cpp"
+  "${XRT_XDP_PROFILE_EVENTS_CREATOR_DIR}/*.h"
+  "${XRT_XDP_PROFILE_EVENTS_CREATOR_DIR}/*.cpp"
   "${XRT_XDP_PROFILE_DEVICE_DIR}/*.h"
   "${XRT_XDP_PROFILE_DEVICE_DIR}/*.cpp"
+  "${XRT_XDP_PROFILE_OCL_DEVICE_LOGGER_DIR}/*.h"
+  "${XRT_XDP_PROFILE_OCL_DEVICE_LOGGER_DIR}/*.cpp"
+  "${XRT_XDP_PROFILE_XRT_DEVICE_DIR}/*.h"
+  "${XRT_XDP_PROFILE_XRT_DEVICE_DIR}/*.cpp"
   "${XRT_XDP_PROFILE_VP_WRITER_DIR}/*.h"
   "${XRT_XDP_PROFILE_VP_WRITER_DIR}/*.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/*.h"
@@ -212,8 +241,10 @@ file(GLOB XRT_XDP_ALL_SRC_WIN
 
 add_library(xdp SHARED ${XRT_XDP_ALL_SRC_WIN})
 add_library(oclxdp SHARED ${XRT_XDP_PROFILE_OCL_PLUGIN_FILES})
-add_library(xdp_hal_plugin SHARED ${XRT_XDP_PROFILE_HAL_PLUGIN_FILES})
-add_library(xdp_hal_api_interface_plugin SHARED ${XRT_XDP_PROFILE_HAL_INTERFACE_PLUGIN_FILES})
+
+# Plugin modules
+add_library(xdp_hal_plugin MODULE ${XRT_XDP_PROFILE_HAL_PLUGIN_FILES})
+add_library(xdp_hal_api_interface_plugin MODULE ${XRT_XDP_PROFILE_HAL_INTERFACE_PLUGIN_FILES})
 
 add_dependencies(xdp xrt_core xilinxopencl)
 add_dependencies(oclxdp xdp xilinxopencl)
@@ -226,8 +257,8 @@ target_link_libraries(xdp_hal_plugin xdp xrt_core)
 target_link_libraries(xdp_hal_api_interface_plugin xdp)
 
 install(TARGETS xdp oclxdp xdp_hal_plugin xdp_hal_api_interface_plugin
-  ARCHIVE DESTINATION ${XRT_INSTALL_DIR}/lib
-  LIBRARY DESTINATION ${XRT_INSTALL_DIR}/lib
+  ARCHIVE DESTINATION ${XRT_INSTALL_LIB_DIR}
+  LIBRARY DESTINATION ${XRT_INSTALL_LIB_DIR}
   RUNTIME DESTINATION ${XRT_INSTALL_DIR}/bin)
 
 # Only install these files for PCIe device for now, which is .

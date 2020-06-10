@@ -7,11 +7,8 @@ if(${CMAKE_BUILD_TYPE} STREQUAL "Release" AND ${XRT_NATIVE_BUILD} STREQUAL "yes"
   add_subdirectory(doc)
 endif()
 
-include_directories(
-  ${CMAKE_CURRENT_SOURCE_DIR}
-  ${BOOST_FILESYSTEM_INCLUDE_DIRS}
-  ${BOOST_SYSTEM_INCLUDE_DIRS}
-  )
+# Default include search path starts at runtime_src
+include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 
 option(XOCL_VERBOSE "Enable xocl verbosity" OFF)
 option(XRT_VERBOSE "Enable xrt verbosity" OFF)
@@ -35,9 +32,8 @@ add_subdirectory(xdp)
 # TODO version.h was included.
 # Remove this limitation once we can generate version.h for mpsoc.
 if (${XRT_NATIVE_BUILD} STREQUAL "yes")
-  add_subdirectory(tools/xclbin)
+  add_subdirectory(tools/xclbinutil)
 endif()
-add_subdirectory(xclbin)
 add_subdirectory(xocl)
 add_subdirectory(xrt)
 add_subdirectory(ert)
@@ -79,10 +75,10 @@ else()
 
   # Build Subdirectories
   add_subdirectory(xocl)
-  add_subdirectory(xclbin)
   add_subdirectory(xrt)
-  add_subdirectory(tools/xclbin)
+  add_subdirectory(tools/xclbinutil)
   add_subdirectory(tools/scripts)
   add_subdirectory(core)
   add_subdirectory(xdp)
 endif()
+

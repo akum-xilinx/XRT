@@ -162,12 +162,22 @@ static int xocl_match_slot_and_wait(struct device *dev, void *data)
 {
 	struct xclmgmt_dev *lro = data;
 	struct pci_dev *pdev;
+	int userpf= -1;
 	int ret = 0;
 
 	pdev = to_pci_dev(dev);
 
+	if (lro->core.fdt_blob) {
+		userpf = xocl_fdt_get_userpf(lro, lro->core.fdt_blob);
+		if (userpf < 0) {
+			mgmt_err(lro, "can not find userpf");
+			return -EINVAL;
+		}
+	}
+
 	if (pdev != lro->core.pdev &&
-		(XOCL_DEV_ID(pdev) >> 3) == (XOCL_DEV_ID(lro->pci_dev) >> 3))
+		(XOCL_DEV_ID(pdev) >> 3) == (XOCL_DEV_ID(lro->pci_dev) >> 3) &&
+		(userpf < 0 || PCI_FUNC(pdev->devfn) == userpf))
 		ret = xocl_wait_pci_status(pdev, PCI_COMMAND_MASTER, 0, 60);
 
 	return ret;
@@ -183,12 +193,22 @@ static int xocl_match_slot_set_master(struct device *dev, void *data)
 	struct xclmgmt_dev *lro = data;
 	struct pci_dev *pdev;
 	u16 pci_cmd;
+	int userpf = -1;
 	int ret = 0;
 
 	pdev = to_pci_dev(dev);
 
+	if (lro->core.fdt_blob) {
+		userpf = xocl_fdt_get_userpf(lro, lro->core.fdt_blob);
+		if (userpf < 0) {
+			mgmt_err(lro, "can not find userpf");
+			return -EINVAL;
+		}
+	}
+
 	if (pdev != lro->core.pdev &&
-		(XOCL_DEV_ID(pdev) >> 3) == (XOCL_DEV_ID(lro->pci_dev) >> 3)) {
+		(XOCL_DEV_ID(pdev) >> 3) == (XOCL_DEV_ID(lro->pci_dev) >> 3) &&
+		(userpf < 0 || PCI_FUNC(pdev->devfn) == userpf)) {
 		pci_read_config_word(pdev, PCI_COMMAND, &pci_cmd);
 		if (!(pci_cmd & PCI_COMMAND_MASTER)) {
 			pci_cmd |= PCI_COMMAND_MASTER;
@@ -229,7 +249,7 @@ long xclmgmt_hot_reset(struct xclmgmt_dev *lro, bool force)
 		lro->instance, ep_name,
 		PCI_SLOT(pdev->devfn), PCI_FUNC(pdev->devfn));
 
-	if (!force) {
+	if (!force && xrt_reset_syncup) {
 		mgmt_info(lro, "wait for master off for all functions");
 		err = xocl_wait_master_off(lro);
 		if (err)
@@ -238,29 +258,33 @@ long xclmgmt_hot_reset(struct xclmgmt_dev *lro, bool force)
 
 	xocl_thread_stop(lro);
 
-	/* request XMC/ERT to stop */
-	xocl_mb_stop(lro);
-
-	/* If the PCIe board has PS */
-	xocl_ps_sys_reset(lro);
-
 	/*
 	 * lock pci config space access from userspace,
 	 * save state and issue PCIe secondary bus reset
 	 */
 	if (!XOCL_DSA_PCI_RESET_OFF(lro)) {
 		xocl_subdev_destroy_by_level(lro, XOCL_SUBDEV_LEVEL_URP);
+		(void) xocl_subdev_offline_by_id(lro, XOCL_SUBDEV_FLASH);
 		(void) xocl_subdev_offline_by_id(lro, XOCL_SUBDEV_ICAP);
 		(void) xocl_subdev_offline_by_id(lro, XOCL_SUBDEV_MAILBOX);
 		(void) xocl_subdev_offline_by_id(lro, XOCL_SUBDEV_AF);
+		/* request XMC/ERT to stop */
+		xocl_mb_stop(lro);
+		/* If the PCIe board has PS */
+		xocl_ps_sys_reset(lro);
 #if defined(__PPC64__)
 		pci_fundamental_reset(lro);
 #else
 		xclmgmt_reset_pci(lro);
 #endif
+		/* restart XMC/ERT */
+		xocl_mb_reset(lro);
+		/* If the PCIe board has PS. This could take 50 seconds */
+		xocl_ps_wait(lro);
 		(void) xocl_subdev_online_by_id(lro, XOCL_SUBDEV_AF);
 		(void) xocl_subdev_online_by_id(lro, XOCL_SUBDEV_MAILBOX);
 		(void) xocl_subdev_online_by_id(lro, XOCL_SUBDEV_ICAP);
+		(void) xocl_subdev_online_by_id(lro, XOCL_SUBDEV_FLASH);
 	} else {
 		mgmt_warn(lro, "PCI Hot reset is not supported on this board.");
 	}
@@ -289,15 +313,13 @@ long xclmgmt_hot_reset(struct xclmgmt_dev *lro, bool force)
 	if (dev_info->flags & XOCL_DSAFLAG_AXILITE_FLUSH)
 		platform_axilite_flush(lro);
 
-	/* restart XMC/ERT */
-	xocl_mb_reset(lro);
-
 	lro->reset_requested = false;
 	xocl_thread_start(lro);
 
-	/* If the PCIe board has PS. This could take 50 seconds */
-	xocl_ps_wait(lro);
-	xocl_set_master_on(lro);
+	if (xrt_reset_syncup)
+		xocl_set_master_on(lro);
+	else if (!force)
+		xclmgmt_connect_notify(lro, true);
 
 done:
 	return err;
@@ -396,9 +418,6 @@ int pci_fundamental_reset(struct xclmgmt_dev *lro)
 	u8 hot;
 	struct pci_dev *pci_dev = lro->pci_dev;
 
-	/* freeze and free AXI gate to reset the OCL region before and after the pcie reset. */
-	xocl_icap_reset_axi_gate(lro);
-
 	/*
 	 * lock pci config space access from userspace,
 	 * save state and issue PCIe fundamental reset
@@ -449,8 +468,6 @@ done:
 	rc = pcie_unmask_surprise_down(pci_dev, orig_mask);
 
 	xocl_pci_restore_config_all(lro);
-	/* Also freeze and free AXI gate to reset the OCL region. */
-	xocl_icap_reset_axi_gate(lro);
 
 	return rc;
 }
@@ -460,6 +477,7 @@ static void xclmgmt_reset_pci(struct xclmgmt_dev *lro)
 	struct pci_dev *pdev = lro->pci_dev;
 	struct pci_bus *bus;
 	u8 pci_bctl;
+	u16 pci_cmd, devctl;
 
 	mgmt_info(lro, "Reset PCI");
 
@@ -470,6 +488,23 @@ static void xclmgmt_reset_pci(struct xclmgmt_dev *lro)
 
 	/* Reset secondary bus. */
 	bus = pdev->bus;
+
+	/*
+	 * When flipping the SBR bit, device can fall off the bus. This is usually
+	 * no problem at all so long as drivers are working properly after SBR.
+	 * However, some systems complain bitterly when the device falls off the bus.
+	 * Such as a Dell Servers, The iDRAC is totally independent from the
+	 * operating system; it will still reboot the machine even if the operating
+	 * system ignores the error.
+	 * The quick solution is to temporarily disable the SERR reporting of
+	 * switch port during SBR.
+	 */
+	pci_read_config_word(bus->self, PCI_COMMAND, &pci_cmd);
+	pci_write_config_word(bus->self, PCI_COMMAND, (pci_cmd & ~PCI_COMMAND_SERR));
+	pcie_capability_read_word(bus->self, PCI_EXP_DEVCTL, &devctl);
+	pcie_capability_write_word(bus->self, PCI_EXP_DEVCTL,
+					   (devctl & ~PCI_EXP_DEVCTL_FERE));
+
 	pci_read_config_byte(bus->self, PCI_BRIDGE_CONTROL, &pci_bctl);
 	pci_bctl |= PCI_BRIDGE_CTL_BUS_RESET;
 	pci_write_config_byte(bus->self, PCI_BRIDGE_CONTROL, pci_bctl);
@@ -478,6 +513,9 @@ static void xclmgmt_reset_pci(struct xclmgmt_dev *lro)
 	pci_bctl &= ~PCI_BRIDGE_CTL_BUS_RESET;
 	pci_write_config_byte(bus->self, PCI_BRIDGE_CONTROL, pci_bctl);
 	ssleep(1);
+
+	pcie_capability_write_word(bus->self, PCI_EXP_DEVCTL, devctl);
+	pci_write_config_word(bus->self, PCI_COMMAND, pci_cmd);
 
 	pci_enable_device(pdev);
 
@@ -493,6 +531,8 @@ int xclmgmt_update_userpf_blob(struct xclmgmt_dev *lro)
 	int len, userpf_idx;
 	int ret;
 	struct FeatureRomHeader	rom_header;
+	int offset;
+	const int *version;
 
 	if (!lro->core.fdt_blob)
 		return 0;
@@ -518,7 +558,7 @@ int xclmgmt_update_userpf_blob(struct xclmgmt_dev *lro)
 	userpf_idx = xocl_fdt_get_userpf(lro, lro->core.fdt_blob);
 	if (userpf_idx >= 0) {
 		ret = xocl_fdt_overlay(lro->userpf_blob, 0,
-			lro->core.fdt_blob, 0, userpf_idx);
+			lro->core.fdt_blob, 0, userpf_idx, -1);
 		if (ret) {
 			mgmt_err(lro, "overlay fdt failed %d", ret);
 			goto failed;
@@ -537,6 +577,24 @@ int xclmgmt_update_userpf_blob(struct xclmgmt_dev *lro)
 		mgmt_err(lro, "add vrom failed %d", ret);
 		goto failed;
 	}
+
+	/* Get ERT firmware major version from mgmtpf blob */
+	offset = xocl_fdt_path_offset(lro, lro->core.fdt_blob,
+					"/" NODE_ENDPOINTS "/" NODE_ERT_FW_MEM
+					"/" NODE_FIRMWARE);
+	if (offset < 0) {
+		mgmt_err(lro, "get ert firmware node failed %d", offset);
+	}
+	version = xocl_fdt_getprop(lro, lro->core.fdt_blob, offset, PROP_VERSION_MAJOR, NULL);
+
+	/* Add ERT firmware major version to userpf blob */
+	offset = xocl_fdt_path_offset(lro, lro->userpf_blob,
+					"/" NODE_ENDPOINTS "/" NODE_ERT_SCHED);
+	if (offset < 0) {
+		mgmt_err(lro, "get ert sched node failed %d", offset);
+	}
+	(void) xocl_fdt_setprop(lro, lro->userpf_blob, offset, PROP_VERSION_MAJOR,
+				version, sizeof(int));
 
 	fdt_pack(lro->userpf_blob);
 	lro->userpf_blob_updated = true;
@@ -567,7 +625,7 @@ int xclmgmt_program_shell(struct xclmgmt_dev *lro)
 		ret = -EINVAL;
 		goto failed;
 	}
-	len = fdt_totalsize(lro->bld_blob);
+	len = fdt_totalsize(lro->core.blp_blob);
 	if (len > 100 * 1024 * 1024) {
 		mgmt_err(lro, "dtb is too big");
 		ret = -EINVAL;
@@ -579,7 +637,7 @@ int xclmgmt_program_shell(struct xclmgmt_dev *lro)
 		lro->core.fdt_blob = blob;
 		goto failed;
 	}
-	memcpy(lro->core.fdt_blob, lro->bld_blob, len);
+	memcpy(lro->core.fdt_blob, lro->core.blp_blob, len);
 	ret = xocl_icap_download_rp(lro, XOCL_SUBDEV_LEVEL_PRP,
 			RP_DOWNLOAD_DRY);
 	if (ret) {
@@ -596,13 +654,13 @@ int xclmgmt_program_shell(struct xclmgmt_dev *lro)
 
 	xocl_thread_stop(lro);
 
-	xocl_mb_stop(lro);
-
 	ret = xocl_subdev_destroy_prp(lro);
 	if (ret) {
 		mgmt_err(lro, "destroy prp failed %d", ret);
 		goto failed;
 	}
+
+	xocl_subdev_destroy_by_id(lro, XOCL_SUBDEV_AF);
 
 	ret = xocl_icap_download_rp(lro, XOCL_SUBDEV_LEVEL_PRP,
 			RP_DOWNLOAD_FORCE);
@@ -611,12 +669,17 @@ int xclmgmt_program_shell(struct xclmgmt_dev *lro)
 		goto failed;
 	}
 
+	xocl_subdev_create_by_id(lro, XOCL_SUBDEV_AF);
+
 	ret = xocl_subdev_create_prp(lro);
 	if (ret && ret != -ENODEV) {
 		mgmt_err(lro, "failed to create prp %d", ret);
 		goto failed;
 	}
 
+	(void) xocl_peer_listen(lro, xclmgmt_mailbox_srv, (void *)lro);
+
+	/* reload possible cmc and ert images */
 	xocl_icap_post_download_rp(lro);
 
 	xocl_thread_start(lro);
@@ -635,7 +698,8 @@ static bool xocl_subdev_vsec_is_golden(xdev_handle_t xdev_hdl)
 	int bar;
 	u64 offset;
 
-	if (xocl_subdev_vsec(xdev_hdl, XOCL_VSEC_PLATFORM_INFO, &bar, &offset))
+	if (xocl_subdev_vsec(xdev_hdl, XOCL_VSEC_PLATFORM_INFO, &bar, &offset,
+		NULL))
 		return false;
 
 	return xocl_subdev_vsec_read32(xdev_hdl, bar, offset) ==
@@ -644,12 +708,13 @@ static bool xocl_subdev_vsec_is_golden(xdev_handle_t xdev_hdl)
 
 int xclmgmt_load_fdt(struct xclmgmt_dev *lro)
 {
-	const struct firmware			*fw = NULL;
+	struct xocl_board_private *dev_info = &lro->core.priv;
 	const struct axlf_section_header	*dtc_header;
 	struct axlf				*bin_axlf;
-	char					*vbnv;
-	char					fw_name[256];
 	int					ret;
+	char					*fw_buf = NULL;
+	size_t					fw_size = 0;
+
 
 	if (xocl_subdev_vsec_is_golden(lro)) {
 		mgmt_info(lro, "Skip load_fdt for vsec Golden image");
@@ -657,53 +722,40 @@ int xclmgmt_load_fdt(struct xclmgmt_dev *lro)
 	}
 
 	mutex_lock(&lro->busy_mutex);
-        ret = xocl_rom_find_firmware(lro, fw_name, sizeof(fw_name),
-		lro->core.pdev->device, &fw);
+	ret = xocl_rom_load_firmware(lro, &fw_buf, &fw_size);
 	if (ret)
 		goto failed;
+	bin_axlf = (struct axlf *)fw_buf;
 
-	mgmt_info(lro, "Load fdt from %s", fw_name);
-
-	bin_axlf = (struct axlf *)fw->data;
 	dtc_header = xocl_axlf_section_header(lro, bin_axlf, PARTITION_METADATA);
-	if (!dtc_header)
+	if (!dtc_header) {
+		ret = -ENOENT;
+		mgmt_err(lro, "firmware does not contain PARTITION_METADATA");
 		goto failed;
+	}
 
 	ret = xocl_fdt_blob_input(lro,
-			(char *)fw->data + dtc_header->m_sectionOffset,
-			dtc_header->m_sectionSize);
+			(char *)fw_buf + dtc_header->m_sectionOffset,
+			dtc_header->m_sectionSize, XOCL_SUBDEV_LEVEL_BLD,
+			bin_axlf->m_header.m_platformVBNV);
 	if (ret) {
 		mgmt_err(lro, "Invalid PARTITION_METADATA");
 		goto failed;
 	}
 
-	vbnv = bin_axlf->m_header.m_platformVBNV;
-	if (strlen(vbnv) > 0) {
-		mgmt_info(lro, "Board VBNV: %s", vbnv);
-		ret = xocl_fdt_add_pair(lro, lro->core.fdt_blob, "vbnv", vbnv,
-				strlen(vbnv) + 1);
-		if (ret) {
-			mgmt_err(lro, "Adding VBNV pair failed, %d", ret);
-			goto failed;
-		}
-	}
-
-
-	release_firmware(fw);
-	fw = NULL;
-
 	if (lro->core.priv.flags & XOCL_DSAFLAG_MFG) {
+		/* Minimum set up for golden image. */
 		(void) xocl_subdev_create_by_id(lro, XOCL_SUBDEV_FLASH);
 		(void) xocl_subdev_create_by_id(lro, XOCL_SUBDEV_MB);
 		goto failed;
 	}
 
-	lro->bld_blob = vmalloc(fdt_totalsize(lro->core.fdt_blob));
-	if (!lro->bld_blob) {
+	lro->core.blp_blob = vmalloc(fdt_totalsize(lro->core.fdt_blob));
+	if (!lro->core.blp_blob) {
 		ret = -ENOMEM;
 		goto failed;
 	}
-	memcpy(lro->bld_blob, lro->core.fdt_blob,
+	memcpy(lro->core.blp_blob, lro->core.fdt_blob,
 			fdt_totalsize(lro->core.fdt_blob));
 
 	xclmgmt_connect_notify(lro, false);
@@ -712,7 +764,10 @@ int xclmgmt_load_fdt(struct xclmgmt_dev *lro)
 	if (ret)
 		goto failed;
 
-	ret = xocl_icap_download_boot_firmware(lro);
+	/* VERSAL doesn't have icap to download, will need to refactor the code */
+	if (!(dev_info->flags & XOCL_DSAFLAG_VERSAL))
+		ret = xocl_icap_download_boot_firmware(lro);
+
 	if (ret)
 		goto failed;
 
@@ -726,8 +781,7 @@ int xclmgmt_load_fdt(struct xclmgmt_dev *lro)
 	lro->ready = true;
 
 failed:
-	if (fw)
-		release_firmware(fw);
+	vfree(fw_buf);
 	mutex_unlock(&lro->busy_mutex);
 
 	return ret;

@@ -19,15 +19,15 @@
 
 // Include files
 // Please keep these to the bare minimum
+#include "core/common/device.h"
+
 #include <string>
 #include <memory>
 #include <boost/property_tree/ptree.hpp>
 #include <boost/program_options.hpp>
-
-
+#include <boost/algorithm/string.hpp>
 
 namespace XBUtilities {
-
   typedef enum {
     MT_MESSAGE,
     MT_INFO,
@@ -47,6 +47,10 @@ namespace XBUtilities {
    */
   void setVerbose(bool _bVerbose);
   void setTrace(bool _bVerbose);
+
+  void setShowHidden(bool _bShowHidden);
+  bool getShowHidden();
+
   void disable_escape_codes( bool _disable );
   bool is_esc_enabled();  
 
@@ -63,6 +67,7 @@ namespace XBUtilities {
   void trace_print_tree(const std::string & _name, 
                         const boost::property_tree::ptree & _pt);
 
+  bool can_proceed();
   // ---------
   void wrap_paragraph( const std::string & _unformattedString, 
                        unsigned int _indentWidth, 
@@ -74,6 +79,11 @@ namespace XBUtilities {
                         unsigned int _columnWidth, 
                         bool _indentFirstLine,
                         std::string &_formattedString);
+
+  void collect_devices( const std::set<std::string>  &_deviceBDFs,
+                        bool _inUserDomain,
+                        xrt_core::device_collection &_deviceCollection);
+  void report_available_devices();
 };
 
 #endif

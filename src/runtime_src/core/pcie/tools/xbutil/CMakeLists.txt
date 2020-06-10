@@ -18,11 +18,11 @@ target_link_libraries(xbutil
   pthread
   rt
   dl
-  boost_filesystem
-  boost_system
+  ${Boost_FILESYSTEM_LIBRARY}
+  ${Boost_SYSTEM_LIBRARY}
   uuid
   ${CURSES_LIBRARIES}
   )
 
-install (TARGETS xbutil RUNTIME DESTINATION ${XRT_INSTALL_DIR}/bin)
+install (TARGETS xbutil RUNTIME DESTINATION ${XRT_INSTALL_UNWRAPPED_DIR})
 install (PROGRAMS "xbsak.sh" DESTINATION ${XRT_INSTALL_DIR}/bin RENAME "xbsak")

@@ -92,6 +92,7 @@ static ssize_t kdsstat_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(kdsstat);
 
+/* -live memory usage-- */
 static ssize_t xocl_mm_stat(struct xocl_dev *xdev, char *buf, bool raw)
 {
 	int i, err;
@@ -100,7 +101,7 @@ static ssize_t xocl_mm_stat(struct xocl_dev *xdev, char *buf, bool raw)
 	size_t memory_usage = 0;
 	unsigned int bo_count = 0;
 	const char *txt_fmt = "[%s] %s@0x%012llx (%lluMB): %lluKB %dBOs\n";
-	const char *raw_fmt = "%llu %d\n";
+	const char *raw_fmt = "%llu %d %llu\n";
 	struct mem_topology *topo = NULL;
 	struct drm_xocl_mm_stat stat;
 
@@ -128,7 +129,7 @@ static ssize_t xocl_mm_stat(struct xocl_dev *xdev, char *buf, bool raw)
 
 			count = sprintf(buf, raw_fmt,
 				memory_usage,
-				bo_count);
+				bo_count, 0);
 		} else {
 			count = sprintf(buf, txt_fmt,
 				topo->m_mem_data[i].m_used ?
@@ -142,13 +143,13 @@ static ssize_t xocl_mm_stat(struct xocl_dev *xdev, char *buf, bool raw)
 		buf += count;
 		size += count;
 	}
+
 done:
 	XOCL_PUT_MEM_TOPOLOGY(xdev);
 	mutex_unlock(&xdev->dev_lock);
 	return size;
 }
 
-/* -live memory usage-- */
 static ssize_t memstat_show(struct device *dev,
 	struct device_attribute *attr, char *buf)
 {
@@ -166,121 +167,6 @@ static ssize_t memstat_raw_show(struct device *dev,
 	return xocl_mm_stat(xdev, buf, true);
 }
 static DEVICE_ATTR_RO(memstat_raw);
-
-static ssize_t p2p_enable_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct xocl_dev *xdev = dev_get_drvdata(dev);
-	u64 size;
-	struct resource *res;
-
-	/*
-	 * temp handle u50 case which has P2P bar however it is not actually
-	 * work
-	 */
-	if (xdev->core.priv.flags & XOCL_DSAFLAG_DYNAMIC_IP) {
-		res = xocl_subdev_get_ioresource(xdev, NODE_P2P);
-		if (!res) {
-			xocl_info(dev, "p2p endpoint is not found");
-			return sprintf(buf, "%d\n", ENXIO);
-		}
-	}
-
-	if (xdev->p2p_mem_chunk_num)
-		return sprintf(buf, "1\n");
-	else if (xocl_get_p2p_bar(xdev, &size) >= 0 &&
-		size > XOCL_P2P_CHUNK_SIZE)
-		return sprintf(buf, "%d\n", EBUSY);
-	else if (xocl_get_p2p_bar(xdev, &size) < 0 &&
-		(xdev->p2p_bar_idx < 0 ||
-		xdev->p2p_bar_len <= XOCL_P2P_CHUNK_SIZE))
-		return sprintf(buf, "%d\n", ENXIO);
-
-	return sprintf(buf, "0\n");
-}
-
-static ssize_t p2p_enable_store(struct device *dev,
-		struct device_attribute *da, const char *buf, size_t count)
-{
-	struct xocl_dev *xdev = dev_get_drvdata(dev);
-	struct pci_dev *pdev = xdev->core.pdev;
-	int ret, p2p_bar;
-	u32 enable;
-	u64 size, curr_size;
-	struct resource *res;
-
-
-	if (kstrtou32(buf, 10, &enable) == -EINVAL || enable > 1)
-		return -EINVAL;
-
-	/*
-	 * temp handle u50 case which has P2P bar however it is not actually
-	 * work
-	 */
-	if (xdev->core.priv.flags & XOCL_DSAFLAG_DYNAMIC_IP) {
-		res = xocl_subdev_get_ioresource(xdev, NODE_P2P);
-		if (!res) {
-			xocl_info(&pdev->dev, "p2p endpoint is not found");
-			return -ENOTSUPP;
-		}
-	}
-
-	p2p_bar = xocl_get_p2p_bar(xdev, &curr_size);
-	if (p2p_bar < 0) {
-		xocl_err(&pdev->dev, "p2p bar is not configurable");
-		return -ENXIO;
-	}
-
-	if (xdev->core.priv.p2p_bar_sz > 0)
-		size = xdev->core.priv.p2p_bar_sz;
-	else {
-		size = xocl_get_ddr_channel_size(xdev) *
-			xocl_get_ddr_channel_count(xdev); /* GB */
-	}
-
-	size = (ffs(size) == fls(size)) ? (fls(size) - 1) : fls(size);
-	size = enable ? (size + 10) : (XOCL_P2P_CHUNK_SHIFT - 20);
-	if (xocl_pci_rebar_size_to_bytes(size) == curr_size) {
-		if (enable) {
-			xocl_info(&pdev->dev, "p2p is enabled, bar size %d M",
-				(1 << size));
-		} else {
-			xocl_info(&pdev->dev, "p2p is disabled, bar size %dM",
-				(1 << size));
-		}
-		return count;
-	}
-
-	xocl_info(&pdev->dev, "Resize p2p bar %d to %d M ", p2p_bar,
-			(1 << size));
-	xocl_p2p_fini(xdev, false);
-
-	ret = xocl_pci_resize_resource(pdev, p2p_bar, size);
-	if (ret) {
-		xocl_err(&pdev->dev, "Failed to resize p2p BAR %d", ret);
-		goto failed;
-	}
-
-	xdev->p2p_bar_idx = p2p_bar;
-	xdev->p2p_bar_sz_cached = size;
-	xdev->p2p_bar_len = pci_resource_len(pdev, p2p_bar);
-
-	if (enable) {
-		ret = xocl_p2p_init(xdev);
-		if (ret) {
-			xocl_err(&pdev->dev, "Failed to reserve p2p memory %d",
-					ret);
-		}
-	}
-
-	return count;
-
-failed:
-	return ret;
-
-}
-
-static DEVICE_ATTR(p2p_enable, 0644, p2p_enable_show, p2p_enable_store);
 
 static ssize_t dev_offline_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
@@ -312,10 +198,13 @@ static ssize_t shutdown_store(struct device *dev,
 	u32 val;
 
 
-	if (kstrtou32(buf, 10, &val) == -EINVAL || val != 1)
+	if (kstrtou32(buf, 10, &val) == -EINVAL)
 		return -EINVAL;
 
-	xocl_queue_work(xdev, XOCL_WORK_SHUTDOWN, 0);
+	if (val)
+		xocl_queue_work(xdev, XOCL_WORK_SHUTDOWN, 0);
+	else
+		xocl_queue_work(xdev, XOCL_WORK_ONLINE, 0);
 
 	return count;
 }
@@ -541,10 +430,7 @@ static struct attribute *xocl_attrs[] = {
 	&dev_attr_kdsstat.attr,
 	&dev_attr_memstat.attr,
 	&dev_attr_memstat_raw.attr,
-	&dev_attr_user_pf.attr,
-	&dev_attr_p2p_enable.attr,
 	&dev_attr_dev_offline.attr,
-	&dev_attr_shutdown.attr,
 	&dev_attr_mig_calibration.attr,
 	&dev_attr_link_width.attr,
 	&dev_attr_link_speed.attr,
@@ -558,6 +444,17 @@ static struct attribute *xocl_attrs[] = {
 	&dev_attr_logic_uuids.attr,
 	&dev_attr_ulp_uuids.attr,
 	&dev_attr_mig_cache_update.attr,
+	NULL,
+};
+
+/*
+ * persist entries will only be created/destroyed by driver attach/detach
+ * They will not be removed across hot reset, shutdown, switching PLP etc.
+ * So please DO NOT access any subdevice APIs inside store()/show()
+ */
+static struct attribute *xocl_persist_attrs[] = {
+	&dev_attr_shutdown.attr,
+	&dev_attr_user_pf.attr,
 	NULL,
 };
 
@@ -609,6 +506,45 @@ static struct attribute_group xocl_attr_group = {
 	.attrs = xocl_attrs,
 	.bin_attrs = xocl_bin_attrs,
 };
+
+static struct attribute_group xocl_persist_attr_group = {
+	.attrs = xocl_persist_attrs,
+};
+
+int xocl_init_persist_sysfs(struct xocl_dev *xdev)
+{
+	struct device *dev = &xdev->core.pdev->dev;
+	int ret = 0;
+
+	if (xdev->flags & XOCL_FLAGS_PERSIST_SYSFS_INITIALIZED) {
+		xocl_err(dev, "persist sysfs noded already created");
+		return -EINVAL;
+	}
+
+	xocl_info(dev, "Creating persist sysfs");
+	ret = sysfs_create_group(&dev->kobj, &xocl_persist_attr_group);
+	if (ret)
+		xocl_err(dev, "create xocl persist attrs failed: %d", ret);
+
+	xdev->flags |= XOCL_FLAGS_PERSIST_SYSFS_INITIALIZED;
+
+
+	return ret;
+}
+
+void xocl_fini_persist_sysfs(struct xocl_dev *xdev)
+{
+	struct device *dev = &xdev->core.pdev->dev;
+
+	if (!(xdev->flags & XOCL_FLAGS_PERSIST_SYSFS_INITIALIZED)) {
+		xocl_err(dev, "persist sysfs nodes already removed");
+		return;
+	}
+
+	xocl_info(dev, "Removing persist sysfs");
+	sysfs_remove_group(&dev->kobj, &xocl_persist_attr_group);
+	xdev->flags &= ~XOCL_FLAGS_PERSIST_SYSFS_INITIALIZED;
+}
 
 int xocl_init_sysfs(struct xocl_dev *xdev)
 {

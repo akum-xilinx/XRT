@@ -31,6 +31,7 @@ extern "C" {
  */
 
 #define XRT_BO_FLAGS_MEMIDX_MASK	(0xFFFFFFUL)
+#define	XCL_BO_FLAGS_NONE		(0)
 #define	XCL_BO_FLAGS_CACHEABLE		(1 << 24)
 #define	XCL_BO_FLAGS_KERNPTR		(1 << 25)
 #define	XCL_BO_FLAGS_SVM		(1 << 27)

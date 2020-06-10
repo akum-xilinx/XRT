@@ -15,8 +15,6 @@
  */
 
 // Sub Commands
-#include "SubCmdFlash.h"
-#include "SubCmdVersion.h"
 #include "SubCmdProgram.h"
 #include "SubCmdReset.h"
 #include "SubCmdStatus.h"
@@ -49,26 +47,14 @@ int main( int argc, char** argv )
     // Syntax: SubCmdClass( IsHidden, IsDepricated, IsPreliminary)
     subCommands.emplace_back(std::make_shared<   SubCmdProgram  >(false, false, false));
     subCommands.emplace_back(std::make_shared<     SubCmdReset  >(false, false, false));
-    subCommands.emplace_back(std::make_shared<  SubCmdAdvanced  >(false, false,  true));
-    subCommands.emplace_back(std::make_shared<     SubCmdStatus >(false, false, false));
+    subCommands.emplace_back(std::make_shared<  SubCmdAdvanced  >(true,  false,  true));
+    subCommands.emplace_back(std::make_shared<    SubCmdStatus  >(false, false, false));
   }
 
-  // Add depricated commands
-  #ifdef ENABLE_DEPRECATED_2020_1_SUBCMDS
-  {
-    // Syntax: SubCmdClass( IsHidden, IsDepricated, IsPreliminary)
-    subCommands.emplace_back(std::make_shared<   SubCmdFlash >(false, true, false));
-    subCommands.emplace_back(std::make_shared< SubCmdVersion >(false, true, false));
-  }
-  #endif
+  const std::string executable = "xbmgmt";
 
-  // -- Determine and set the executable name for each subcommand
-  boost::filesystem::path pathAndFile(argv[0]);
-  const std::string executable = pathAndFile.stem().string();
-
-  for (auto & subCommand : subCommands) {
+  for (auto & subCommand : subCommands) 
     subCommand->setExecutableName(executable);
-  }
 
   // -- Program Description
   const std::string description = 
@@ -77,7 +63,7 @@ int main( int argc, char** argv )
 
   // -- Ready to execute the code
   try {
-    main_( argc, argv, description, subCommands);
+    main_(argc, argv, executable, description, subCommands);
     return 0;
   } catch (const std::exception &e) {
     xrt_core::send_exception_message(e.what(), executable.c_str());

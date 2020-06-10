@@ -47,6 +47,11 @@
 #include "core/common/utils.h"
 #include "core/pcie/common/dd.h"
 
+#ifdef __GNUC__
+# pragma GCC diagnostic push
+# pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+
 #define TO_STRING(x) #x
 //#define AXI_FIREWALL Not supported for AWS
 
@@ -238,7 +243,7 @@ public:
             if (!((buf[0] == 0x0) || (buf[0] == 0x4) || (buf[0] == 0x6))) {
                 return -EBUSY;
             }
-        }        
+        }
         return 0;
     }
 
@@ -298,8 +303,8 @@ public:
         if (!buf.empty())
              ostr << "\nXclbin ID:  0x" << buf << "\n";
         else
-            ostr << "WARNING: 'xclbinuuid' invalid, unable to report xclbinuuid. Has the bitstream been loaded? See 'awssak program'.\n"; 
- 
+            ostr << "WARNING: 'xclbinuuid' invalid, unable to report xclbinuuid. Has the bitstream been loaded? See 'awssak program'.\n";
+
         std::vector<char> mem_topo;
         xcldev::sysfs_get(dev_name, "icap", "mem_topology", errmsg, mem_topo);
 
@@ -502,8 +507,13 @@ public:
                                 break;
                         }
                         if( result >= 0 ) {
-                            DMARunner runner( m_handle, blockSize, i );
-                            result = runner.run();
+                            try {
+                                DMARunner runner( m_handle, blockSize, i );
+                                result = runner.run();
+                            } catch (const xrt_core::error &ex) {
+                                std::cout << "ERROR: " << ex.what() << std::endl;
+                                result = ex.get();
+                            }
                         }
 
                         if( result < 0 ) {
@@ -531,10 +541,13 @@ public:
                         return result;
                 }
 
-                DMARunner runner( m_handle, blockSize );//, xcl_bank[i] );
-                result = runner.run();
-                if( result < 0 )
-                    return result;
+                try {
+                    DMARunner runner( m_handle, blockSize );//, xcl_bank[i] );
+                    result = runner.run();
+                } catch (const xrt_core::error &ex) {
+                    std::cout << "ERROR: " << ex.what() << std::endl;
+                    return ex.get();
+                }
             }
         }
 
@@ -555,16 +568,6 @@ public:
 
     int memwrite( unsigned long long aStartAddr, unsigned long long aSize, char *srcBuf )
     {
-        if( strstr( m_devinfo.mName, "-xare" ) ) { //This is ARE device
-            if( aStartAddr > m_devinfo.mDDRSize ) {
-                std::cout << "Start address " << std::hex << aStartAddr <<
-                             " is over ARE" << std::endl;
-            }
-            if( aSize > m_devinfo.mDDRSize || aStartAddr + aSize > m_devinfo.mDDRSize ) {
-                std::cout << "Write size " << std::dec << aSize << " from address 0x" << std::hex << aStartAddr <<
-                             " is over ARE" << std::endl;
-            }
-        }
         return memaccess(m_handle, m_devinfo.mDDRSize, m_devinfo.mDataAlignment, xcldev::pci_device_scanner::device_list[ m_idx ].user_name).write( aStartAddr, aSize, srcBuf );
     }
 
@@ -661,5 +664,9 @@ void printHelp(const std::string& exe);
 int xclAwssak(int argc, char *argv[]);
 
 } // end namespace xcldev
+
+#ifdef __GNUC__
+# pragma GCC diagnostic pop
+#endif
 
 #endif /* AWSSAK_H */
