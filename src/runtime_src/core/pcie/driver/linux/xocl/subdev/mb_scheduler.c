@@ -4287,9 +4287,10 @@ void xocl_execbuf_completion (struct work_struct* work)
 				struct drm_xocl_exec_metadata, compltn_work);
     struct drm_xocl_bo *xobj = container_of(xobj_metadata, 
 				struct drm_xocl_bo, metadata);
+    struct ert_start_kernel_cmd *scmd = (struct ert_start_kernel_cmd *)xobj->vmapping;
 
     if (xobj->metadata.execbuf_cb_fn)
-        xobj->metadata.execbuf_cb_fn((void *)xobj->metadata.execbuf_cb_data);
+        xobj->metadata.execbuf_cb_fn((unsigned long)xobj->metadata.execbuf_cb_data, scmd->state);
 }
 
 static int

@@ -30,6 +30,7 @@
 #include "xocl_kernel_api.h"
 
 //TO-DO: Remove these
+#define	INVALID_BO_PADDR	0xffffffffffffffffull
 #ifdef _XOCL_BO_DEBUG
 #define BO_ENTER(fmt, args...)          \
         printk(KERN_INFO "[BO] Entering %s:"fmt"\n", __func__, ##args)
@@ -53,6 +54,38 @@ static inline void *drm_malloc_ab(size_t nmemb, size_t size)
         return kvmalloc_array(nmemb, size, GFP_KERNEL);
 }
 #endif
+
+static size_t xocl_bo_physical_addr(const struct drm_xocl_bo *xobj)
+{
+	uint64_t paddr;
+
+	paddr = xobj->mm_node ? xobj->mm_node->start : INVALID_BO_PADDR;
+	return paddr;
+}
+
+static struct sg_table *alloc_onetime_sg_table(struct page **pages, uint64_t offset, uint64_t size)
+{
+        int ret;
+        unsigned int nr_pages;
+        struct sg_table *sgt = kmalloc(sizeof(struct sg_table), GFP_KERNEL);
+
+        if (!sgt)
+                return ERR_PTR(-ENOMEM);
+
+        pages += (offset >> PAGE_SHIFT);
+        offset &= (~PAGE_MASK);
+        nr_pages = PAGE_ALIGN(size + offset) >> PAGE_SHIFT;
+
+        ret = sg_alloc_table_from_pages(sgt, pages, nr_pages, offset, size, GFP_KERNEL);
+        if (ret)
+                goto cleanup;
+
+        return sgt;
+
+cleanup:
+        kfree(sgt);
+        return ERR_PTR(-ENOMEM);
+}
 
 struct list_head gem_obj_list;
 LIST_HEAD(gem_obj_list);
@@ -464,4 +497,114 @@ void xocl_release_buffers_ifc(void)
 	spin_unlock(&gem_obj_list_lock);
 }
 EXPORT_SYMBOL_GPL(xocl_release_buffers_ifc);
+
+int xocl_migrate_bo_async_ifc(struct drm_xocl_sync_bo *args, void (*cb_func)(unsigned long, int), void *ctx_data)
+{
+	const struct drm_xocl_bo *xobj;
+	struct sg_table *sgt;
+	u64 paddr = 0;
+	//int channel = 0;
+	ssize_t ret = 0;
+	struct xocl_drm *drm_p = uapp_drm_context.dev->dev_private;
+	struct xocl_dev *xdev = drm_p->xdev;
+	struct scatterlist *sg;
+
+        struct drm_gem_object *gem_obj;
+
+	u32 dir = (args->dir == DRM_XOCL_SYNC_BO_TO_DEVICE) ? 1 : 0;
+
+	if (!atomic_read(&uapp_drm_context.active)) {
+		return -EFAULT;
+	}
+
+	//pr_err("%s: bohandle:%x cb_func:%llx ctx:%llx", __func__, args->handle, (u64)cb_func, (u64)ctx_data);
+	gem_obj = xocl_gem_object_lookup(uapp_drm_context.dev, 
+					uapp_drm_context.file,
+                                        args->handle);
+	if (!gem_obj) {
+		DRM_ERROR("Failed to look up GEM BO %d\n", args->handle);
+		return -ENOENT;
+	}
+
+	xobj = to_xocl_bo(gem_obj);
+	BO_ENTER("xobj %p", xobj);
+	sgt = xobj->sgt;
+	sg = sgt->sgl;
+
+	if (!xocl_bo_sync_able(xobj->flags)) {
+		DRM_ERROR("BO %d doesn't support sync_bo\n", args->handle);
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+
+	if (xocl_bo_cma(xobj)) {
+
+		if (dir) {
+			dma_sync_single_for_device(&(XDEV(xdev)->pdev->dev), sg_phys(sg),
+				sg->length, DMA_TO_DEVICE);
+		} else {
+			dma_sync_single_for_cpu(&(XDEV(xdev)->pdev->dev), sg_phys(sg),
+				sg->length, DMA_FROM_DEVICE);
+		}
+		goto out;
+	}
+
+	//Sarab: If it is a remote BO then why do sync over ARE.
+	//We should do sync directly using the other device which this bo locally.
+	//So that txfer is: HOST->PCIE->DDR; Else it will be HOST->PCIE->ARE->DDR
+	paddr = xocl_bo_physical_addr(xobj);
+
+	if (paddr == 0xffffffffffffffffull)
+		return -EINVAL;
+
+	if ((args->offset + args->size) > gem_obj->size) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	/* only invalidate the range of addresses requested by the user */
+	/*
+	if (args->dir == DRM_XOCL_SYNC_BO_TO_DEVICE)
+		flush_kernel_vmap_range(kaddr, args->size);
+	else if (args->dir == DRM_XOCL_SYNC_BO_FROM_DEVICE)
+		invalidate_kernel_vmap_range(kaddr, args->size);
+	else {
+		ret = -EINVAL;
+		goto out;
+	}
+	*/
+	paddr += args->offset;
+
+	if (args->offset || (args->size != xobj->base.size)) {
+		sgt = alloc_onetime_sg_table(xobj->pages, args->offset, args->size);
+		if (IS_ERR(sgt)) {
+			ret = PTR_ERR(sgt);
+			goto out;
+		}
+	}
+
+	//drm_clflush_sg(sgt);
+#if 0
+	channel = xocl_acquire_channel(xdev, dir);
+	if (channel < 0) {
+		ret = -EINVAL;
+		goto clear;
+	}
+	/* Now perform DMA */
+	ret = xocl_migrate_bo(xdev, sgt, dir, paddr, channel, args->size);
+	if (ret >= 0)
+		ret = (ret == args->size) ? 0 : -EIO;
+	xocl_release_channel(xdev, dir, channel);
+#endif
+	ret = xocl_async_migrate_bo(xdev, sgt, dir, paddr, 0, args->size, cb_func, ctx_data);
+clear:
+	if (args->offset || (args->size != xobj->base.size)) {
+		sg_free_table(sgt);
+		kfree(sgt);
+	}
+out:
+	XOCL_DRM_GEM_OBJECT_PUT_UNLOCKED(gem_obj);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(xocl_migrate_bo_async_ifc);
 

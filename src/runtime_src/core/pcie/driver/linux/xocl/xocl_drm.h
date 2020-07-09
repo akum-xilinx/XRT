@@ -23,7 +23,7 @@
 #endif
 
 
-typedef void (*xocl_execbuf_callback)(void *data);
+typedef void (*xocl_execbuf_callback)(unsigned long data, int error);
 
 /**
  * struct drm_xocl_exec_metadata - Meta data for exec bo
