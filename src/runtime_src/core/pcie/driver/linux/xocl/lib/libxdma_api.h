@@ -74,6 +74,7 @@ struct xdma_io_cb {
 	struct xdma_request_cb *req;
 	u8 write:1;
 	void (*io_done)(unsigned long cb_hndl, int err);
+	struct work_struct done_work;
 };
 
 

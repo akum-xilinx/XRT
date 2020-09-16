@@ -875,6 +875,21 @@ static int free_desc_set(struct xdma_engine *engine,
 	return ret;
 }
 
+#define NUM_IO_DELIVERY_CPUS 2
+
+inline static int get_cpu_for_io_done(struct xdma_engine *engine)
+{
+	return engine->cpu_idx + (engine->xdev->engines_num*(1+
+			(atomic_fetch_add(1, &engine->num_done)
+			% NUM_IO_DELIVERY_CPUS)));
+}
+
+static void notify_io_done(struct work_struct *work)
+{
+	struct xdma_io_cb *cb = container_of(work, struct xdma_io_cb, done_work);
+	cb->io_done((unsigned long)cb->private, 0);
+}
+
 static int process_completions(struct xdma_engine *engine,
 		unsigned int desc_dequeued)
 {
@@ -928,7 +943,10 @@ static int process_completions(struct xdma_engine *engine,
 				struct xdma_io_cb *cb = req->cb;
 
 				cb->done_bytes = req->done;
-				cb->io_done((unsigned long)cb->private, 0);
+				INIT_WORK(&cb->done_work, notify_io_done);
+				schedule_work_on(get_cpu_for_io_done(engine), 
+						&cb->done_work);
+				//cb->io_done((unsigned long)cb->private, 0);
 				xdma_request_release(engine->xdev, req);
 			} else
 				wake_up(&req->arbtr_wait);

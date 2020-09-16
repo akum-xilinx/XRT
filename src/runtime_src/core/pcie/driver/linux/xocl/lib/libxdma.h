@@ -528,6 +528,7 @@ struct xdma_engine {
 
 	/* cpu attached to intr_work */
 	unsigned int intr_work_cpu;
+	atomic_t num_done;
 
 };
 
